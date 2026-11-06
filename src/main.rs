@@ -207,7 +207,7 @@ impl Default for GameFarmerApp {
     fn default() -> Self {
         AutoUpdater::cleanup_previous_update();
         let mut updater = AutoUpdater::new();
-        updater.check_local_update();
+        updater.check_github_update();
 
         let loaded_settings = AppSettings::load();
         let mut all_games: Vec<DbGame> = serde_json::from_str(GAMES_DB_RAW).unwrap_or_default();
@@ -224,19 +224,11 @@ impl Default for GameFarmerApp {
         all_games.retain(|g| seen.insert(g.name.to_lowercase()));
         let total_db_count = all_games.len();
 
-        let mut logs = vec![format!(
+        let logs = vec![format!(
             "[{}] База Discord: {} игр загружена. Готово к работе.",
             Local::now().format("%H:%M:%S"),
             total_db_count
         )];
-
-        if let UpdateStatus::Available { ref version, .. } = updater.status {
-            logs.push(format!(
-                "[{}] Найдено обновление: версия v{}. Доступно для установки!",
-                Local::now().format("%H:%M:%S"),
-                version
-            ));
-        }
 
         Self {
             language: loaded_settings.language,
@@ -778,6 +770,11 @@ impl eframe::App for GameFarmerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        // Опрос статуса автообновления
+        if let Some(log_msg) = self.updater.poll() {
+            self.add_log(&log_msg);
+        }
+
         // Таймер активности
         if self.is_running {
             if self.last_second_tick.elapsed() >= Duration::from_secs(1) {
@@ -842,59 +839,101 @@ impl eframe::App for GameFarmerApp {
             // ==========================================
             // 1.5. УВЕДОМЛЕНИЕ ОБ ОБНОВЛЕНИИ (ИН-ПЛЕЙС БАННЕР)
             // ==========================================
-            if let UpdateStatus::Available { ref version, ref target_path, ref changelog } = self.updater.status.clone() {
-                let banner_frame = egui::Frame::none()
-                    .fill(Color32::from_rgb(18, 32, 45))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 140, 255)))
-                    .rounding(Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+            match self.updater.status.clone() {
+                UpdateStatus::Available { version, changelog, download_url } => {
+                    let banner_frame = egui::Frame::none()
+                        .fill(Color32::from_rgb(18, 32, 45))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 140, 255)))
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0));
 
-                banner_frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        // 1. Текст слева: название версии
-                        let banner_text = t.update_available_banner.replace("{}", version);
-                        ui.label(
-                            RichText::new(banner_text)
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(90, 195, 255)),
-                        );
-
-                        // Описание (changelog), ограниченное так, чтобы оставалось 210px под кнопку
-                        if !changelog.is_empty() {
-                            let max_changelog_w = (ui.available_width() - 210.0).max(0.0);
-                            if max_changelog_w > 40.0 {
-                                let changelog_label = egui::Label::new(
-                                    RichText::new(format!("({})", changelog))
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(180, 205, 220)),
-                                ).truncate();
-                                ui.add_sized(Vec2::new(max_changelog_w, 20.0), changelog_label);
-                            }
-                        }
-
-                        // 2. Кнопка на правом краю
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let update_btn = egui::Button::new(
-                                RichText::new(t.btn_apply_update)
-                                    .size(11.0)
+                    banner_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // 1. Текст слева: название версии
+                            let banner_text = t.update_available_banner.replace("{}", &version);
+                            ui.label(
+                                RichText::new(banner_text)
+                                    .size(12.0)
                                     .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(0, 122, 204))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(30, 150, 240)))
-                            .rounding(Rounding::same(3.0));
+                                    .color(Color32::from_rgb(90, 195, 255)),
+                            );
 
-                            if ui.add_sized(Vec2::new(190.0, 24.0), update_btn).clicked() {
-                                let path = target_path.clone();
-                                if let Err(e) = self.updater.apply_update(&path) {
-                                    self.add_log(&format!("Ошибка обновления: {}", e));
+                            // Описание (changelog), ограниченное так, чтобы оставалось 210px под кнопку
+                            if !changelog.is_empty() {
+                                let max_changelog_w = (ui.available_width() - 210.0).max(0.0);
+                                if max_changelog_w > 40.0 {
+                                    let changelog_label = egui::Label::new(
+                                        RichText::new(format!("({})", changelog))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(180, 205, 220)),
+                                    ).truncate();
+                                    ui.add_sized(Vec2::new(max_changelog_w, 20.0), changelog_label);
                                 }
                             }
+
+                            // 2. Кнопка на правом краю
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let update_btn = egui::Button::new(
+                                    RichText::new(t.btn_apply_update)
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(0, 122, 204))
+                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(30, 150, 240)))
+                                .rounding(Rounding::same(3.0));
+
+                                if ui.add_sized(Vec2::new(190.0, 24.0), update_btn).clicked() {
+                                    self.updater.start_download_and_install(download_url, version.clone());
+                                    self.add_log(&format!("Загрузка инсталлятора обновления {} с GitHub...", version));
+                                }
+                            });
                         });
                     });
-                });
-                ui.add_space(2.0);
+                    ui.add_space(2.0);
+                }
+                UpdateStatus::Downloading { version, progress, downloaded, total } => {
+                    let banner_frame = egui::Frame::none()
+                        .fill(Color32::from_rgb(18, 35, 30))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 180, 120)))
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+
+                    banner_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let mb_down = downloaded as f64 / 1_048_576.0;
+                            let mb_total = total as f64 / 1_048_576.0;
+                            let text = format!("Скачивание v{}: {:.0}% ({:.1} / {:.1} МБ)", version, progress * 100.0, mb_down, mb_total);
+                            ui.label(
+                                RichText::new(text)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(100, 235, 160)),
+                            );
+
+                            ui.add(egui::ProgressBar::new(progress).desired_width(180.0));
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
+                UpdateStatus::Installing => {
+                    let banner_frame = egui::Frame::none()
+                        .fill(Color32::from_rgb(25, 25, 40))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(120, 120, 240)))
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+
+                    banner_frame.show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Запуск инсталлятора и перезапуск программы...")
+                                .size(12.0)
+                                .strong()
+                                .color(Color32::from_rgb(160, 180, 255)),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
+                _ => {}
             }
 
             // ==========================================
@@ -1543,22 +1582,18 @@ impl eframe::App for GameFarmerApp {
                             .rounding(Rounding::same(3.0));
 
                             if ui.add(check_btn).clicked() {
-                                self.updater.check_local_update();
-                                match &self.updater.status {
-                                    UpdateStatus::Available { version, .. } => {
-                                        self.add_log(&format!("Найдено обновление: v{}", version));
-                                    }
-                                    UpdateStatus::UpToDate => {
-                                        self.add_log("Установлена актуальная версия программы.");
-                                    }
-                                    UpdateStatus::Error(err) => {
-                                        self.add_log(&format!("Ошибка проверки обновлений: {}", err));
-                                    }
-                                    _ => {}
-                                }
+                                self.updater.check_github_update();
+                                self.add_log("Запрос проверки обновлений на GitHub...");
                             }
 
                             match &self.updater.status {
+                                UpdateStatus::Checking => {
+                                    ui.label(
+                                        RichText::new("Проверка GitHub...")
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(200, 200, 100)),
+                                    );
+                                }
                                 UpdateStatus::UpToDate => {
                                     ui.label(
                                         RichText::new(t.status_up_to_date)
@@ -1575,18 +1610,25 @@ impl eframe::App for GameFarmerApp {
                                             .color(Color32::from_rgb(90, 195, 255)),
                                     );
                                 }
+                                UpdateStatus::Downloading { progress, .. } => {
+                                    ui.label(
+                                        RichText::new(format!("Скачивание: {:.0}%", progress * 100.0))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(100, 235, 160)),
+                                    );
+                                }
+                                UpdateStatus::Installing => {
+                                    ui.label(
+                                        RichText::new("Установка...")
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(160, 180, 255)),
+                                    );
+                                }
                                 UpdateStatus::Error(err) => {
                                     ui.label(
                                         RichText::new(format!("[Ошибка] {}", err))
                                             .size(11.0)
                                             .color(Color32::from_rgb(220, 100, 100)),
-                                    );
-                                }
-                                UpdateStatus::Applying => {
-                                    ui.label(
-                                        RichText::new("Установка обновления...")
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(240, 180, 50)),
                                     );
                                 }
                                 _ => {}
