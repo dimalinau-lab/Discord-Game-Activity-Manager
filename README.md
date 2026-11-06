@@ -1,7 +1,7 @@
 # 🎮 Discord Game Activity Manager
 
 <p align="center">
-  <img src="app_icon.ico" width="96" height="96" alt="Discord Game Activity Manager Logo" />
+  <img src="app_icon.png" width="96" height="96" alt="Discord Game Activity Manager Logo" />
 </p>
 
 <p align="center">
@@ -76,12 +76,12 @@
 ### 📦 Установка
 
 #### Способ 1: Установщик Windows (Рекомендуется)
-1. Скачайте [`DiscordGameFarmer_Setup.exe`](dist/DiscordGameFarmer_Setup.exe).
+1. Скачайте [DiscordGameFarmer_Setup.exe](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases/latest/download/DiscordGameFarmer_Setup.exe) со страницы [Релизов](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases).
 2. Запустите файл установки (права администратора не требуются).
 3. Программа установится в `%LOCALAPPDATA%\Programs\DiscordGameFarmer` и создаст ярлыки в меню «Пуск» и на Рабочем столе.
 
 #### Способ 2: Портативная версия
-- Запустите `discord-game-farmer.exe` из папки программы — все настройки сохраняются в локальный `settings.json`.
+- Скачайте `DiscordGameFarmer_v0.2.5_Portable.zip` из [Релизов](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases), распакуйте и запустите `discord-game-farmer.exe`.
 
 ---
 
@@ -90,12 +90,11 @@
 Требования:
 - Установленный компилятор [Rust](https://rustup.rs/) (версия 1.75+).
 - ОС Windows 10/11 (x64).
-- (Опционально) [Inno Setup 6](https://jrsoftware.org/isdl.php) для сборки инсталлятора.
 
 ```bash
 # Клонировать репозиторий
-git clone https://github.com/your-username/discord-game-farmer.git
-cd discord-game-farmer
+git clone https://github.com/dimalinau-lab/Discord-Game-Activity-Manager.git
+cd Discord-Game-Activity-Manager
 
 # Сборка оптимизированного релиза
 cargo build --release
@@ -103,11 +102,6 @@ cargo build --release
 # Бинарники появятся в target/release/
 # - discord-game-farmer.exe
 # - dummy_game.exe
-```
-
-Сборка инсталлятора Inno Setup:
-```bash
-iscc installer.iss
 ```
 
 ---
@@ -165,12 +159,12 @@ iscc installer.iss
 ### 📦 Installation
 
 #### Method 1: Windows Installer (Recommended)
-1. Download [`DiscordGameFarmer_Setup.exe`](dist/DiscordGameFarmer_Setup.exe).
+1. Download [DiscordGameFarmer_Setup.exe](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases/latest/download/DiscordGameFarmer_Setup.exe) from [Releases](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases).
 2. Run the installer (standard user privileges, no UAC prompt).
 3. Installs cleanly to `%LOCALAPPDATA%\Programs\DiscordGameFarmer` with Start Menu and Desktop shortcuts.
 
 #### Method 2: Portable Mode
-- Run `discord-game-farmer.exe` directly. Settings persist to adjacent `settings.json`.
+- Download `DiscordGameFarmer_v0.2.5_Portable.zip` from [Releases](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases), unpack and run `discord-game-farmer.exe`. Settings persist to adjacent `settings.json`.
 
 ---
 
@@ -179,12 +173,11 @@ iscc installer.iss
 Prerequisites:
 - [Rust toolchain](https://rustup.rs/) (stable 1.75+).
 - Windows 10/11 (x64).
-- (Optional) [Inno Setup 6](https://jrsoftware.org/isdl.php) for installer compilation.
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/discord-game-farmer.git
-cd discord-game-farmer
+git clone https://github.com/dimalinau-lab/Discord-Game-Activity-Manager.git
+cd Discord-Game-Activity-Manager
 
 # Build optimized release binary
 cargo build --release
@@ -192,11 +185,6 @@ cargo build --release
 # Binaries located at target/release/:
 # - discord-game-farmer.exe
 # - dummy_game.exe
-```
-
-Compile Inno Setup package:
-```bash
-iscc installer.iss
 ```
 
 ---
