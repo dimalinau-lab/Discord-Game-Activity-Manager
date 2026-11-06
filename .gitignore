@@ -1,0 +1,59 @@
+# ==========================================
+# Rust & Build Artifacts (Сборщики)
+# ==========================================
+target/
+**/*.rs.bk
+
+# ==========================================
+# Installers & Distribution (Установщики)
+# ==========================================
+dist/
+Output/
+installer.iss
+*.iss
+*.iss.tmp
+*.msi
+
+# ==========================================
+# Binaries & Runtime Stubs (Бинарники и заглушки)
+# ==========================================
+*.exe
+*.dll
+*.pdb
+*.old
+*.download
+stubs/
+updates/
+
+# ==========================================
+# Local Runtime & User Data
+# ==========================================
+settings.json
+update_check.json
+run_log.txt
+*.log
+*.tmp
+err.txt
+out.txt
+detectable.json
+
+# ==========================================
+# Python, Virtual Envs & Cache (Папка Python / .venv)
+# ==========================================
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.agents/
