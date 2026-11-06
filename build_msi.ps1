@@ -35,7 +35,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[3/3] Упаковка в MSI через WiX Toolset..." -ForegroundColor Green
 $targetDir = Join-Path $scriptDir "target"
 $wixObj = Join-Path $targetDir "main.wixobj"
-$msiOut = Join-Path $targetDir "DiscordGameFarmer-v0.2.6-x64.msi"
+$msiOut = Join-Path $targetDir "DiscordGameFarmer-v0.2.7-x64.msi"
 $wxsFile = Join-Path $scriptDir "wix\main.wxs"
 
 & $candleExe -nologo -arch x64 -out $wixObj $wxsFile
@@ -49,7 +49,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Копируем установщик в корень проекта для удобного доступа
-$rootMsi = Join-Path $scriptDir "DiscordGameFarmer-v0.2.6-x64.msi"
+$rootMsi = Join-Path $scriptDir "DiscordGameFarmer-v0.2.7-x64.msi"
 Copy-Item $msiOut $rootMsi -Force
 
 $fileInfo = Get-Item $rootMsi
