@@ -75,13 +75,9 @@
 
 ### 📦 Установка
 
-#### Способ 1: Установщик Windows (Рекомендуется)
 1. Скачайте [DiscordGameFarmer_Setup.exe](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases/latest/download/DiscordGameFarmer_Setup.exe) со страницы [Релизов](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases).
 2. Запустите файл установки (права администратора не требуются).
 3. Программа установится в `%LOCALAPPDATA%\Programs\DiscordGameFarmer` и создаст ярлыки в меню «Пуск» и на Рабочем столе.
-
-#### Способ 2: Портативная версия
-- Скачайте `DiscordGameFarmer_v0.2.5_Portable.zip` из [Релизов](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases), распакуйте и запустите `discord-game-farmer.exe`.
 
 ---
 
@@ -158,13 +154,9 @@ cargo build --release
 
 ### 📦 Installation
 
-#### Method 1: Windows Installer (Recommended)
 1. Download [DiscordGameFarmer_Setup.exe](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases/latest/download/DiscordGameFarmer_Setup.exe) from [Releases](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases).
 2. Run the installer (standard user privileges, no UAC prompt).
 3. Installs cleanly to `%LOCALAPPDATA%\Programs\DiscordGameFarmer` with Start Menu and Desktop shortcuts.
-
-#### Method 2: Portable Mode
-- Download `DiscordGameFarmer_v0.2.5_Portable.zip` from [Releases](https://github.com/dimalinau-lab/Discord-Game-Activity-Manager/releases), unpack and run `discord-game-farmer.exe`. Settings persist to adjacent `settings.json`.
 
 ---
 
