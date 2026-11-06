@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product Id="*"
+             Name="Discord Game Activity Manager"
+             Language="1049"
+             Codepage="1251"
+             Version="0.2.6"
+             Manufacturer="dimalinau-lab"
+             UpgradeCode="7E57C32B-963F-4F77-9E41-C68C42BAE999">
+
+        <Package InstallerVersion="301"
+                 Compressed="yes"
+                 InstallScope="perUser"
+                 InstallPrivileges="limited"
+                 SummaryCodepage="1251"
+                 Description="Discord Game Activity Manager Installer"
+                 Comments="Установщик Discord Game Activity Manager" />
+
+        <MajorUpgrade AllowSameVersionUpgrades="yes"
+                      DowngradeErrorMessage="Более новая версия программы уже установлена." />
+
+        <MediaTemplate EmbedCab="yes" />
+
+        <Icon Id="AppIcon" SourceFile="app_icon.ico" />
+        <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+        <Property Id="ARPNOREPAIR" Value="yes" Secure="yes" />
+        <Property Id="ARPNOMODIFY" Value="yes" Secure="yes" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <!-- %LocalAppData%\Programs\DiscordGameFarmer -->
+            <Directory Id="LocalAppDataFolder">
+                <Directory Id="ProgramsFolder" Name="Programs">
+                    <Directory Id="INSTALLFOLDER" Name="DiscordGameFarmer" />
+                </Directory>
+            </Directory>
+
+            <!-- Меню Пуск пользователя -->
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="Discord Game Activity Manager" />
+            </Directory>
+
+            <!-- Рабочий стол пользователя -->
+            <Directory Id="DesktopFolder" Name="Desktop" />
+        </Directory>
+
+        <!-- Компоненты программы -->
+        <DirectoryRef Id="INSTALLFOLDER">
+            <Component Id="MainExecutable" Guid="3A9B26D4-5390-4828-8951-2BD345591901">
+                <RegistryValue Root="HKCU"
+                               Key="Software\dimalinau-lab\DiscordGameFarmer"
+                               Name="MainExecutableInstalled"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+                <File Id="DiscordGameFarmerEXE"
+                      Source="target\release\discord-game-farmer.exe" />
+                <RemoveFolder Id="CleanUpInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+            </Component>
+
+            <Component Id="DummyGameExecutable" Guid="58F3B662-C4B7-4933-A28F-E246603F2902">
+                <RegistryValue Root="HKCU"
+                               Key="Software\dimalinau-lab\DiscordGameFarmer"
+                               Name="DummyGameInstalled"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+                <File Id="DummyGameEXE"
+                      Source="target\release\dummy_game.exe" />
+            </Component>
+
+            <Component Id="LicenseFile" Guid="C1924185-985B-4404-B3B8-8C30B4803903">
+                <RegistryValue Root="HKCU"
+                               Key="Software\dimalinau-lab\DiscordGameFarmer"
+                               Name="LicenseInstalled"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+                <File Id="LicenseTXT"
+                      Source="LICENSE" />
+            </Component>
+        </DirectoryRef>
+
+        <!-- Ярлыки -->
+        <DirectoryRef Id="ApplicationProgramsFolder">
+            <Component Id="StartMenuShortcutComponent" Guid="B8624CA0-0A17-48DF-A66E-01B93CD44904">
+                <Shortcut Id="ApplicationStartMenuShortcut"
+                          Name="Discord Game Activity Manager"
+                          Description="Запуск Discord Game Activity Manager"
+                          Target="[#DiscordGameFarmerEXE]"
+                          WorkingDirectory="INSTALLFOLDER"
+                          Icon="AppIcon" />
+                <RemoveFolder Id="CleanUpStartMenuFolder" On="uninstall" />
+                <RegistryValue Root="HKCU"
+                               Key="Software\dimalinau-lab\DiscordGameFarmer"
+                               Name="StartMenuShortcutInstalled"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="DesktopFolder">
+            <Component Id="DesktopShortcutComponent" Guid="41C283F4-DB77-4927-BA21-2A9319B45905">
+                <Shortcut Id="ApplicationDesktopShortcut"
+                          Name="Discord Game Activity Manager"
+                          Description="Запуск Discord Game Activity Manager"
+                          Target="[#DiscordGameFarmerEXE]"
+                          WorkingDirectory="INSTALLFOLDER"
+                          Icon="AppIcon" />
+                <RegistryValue Root="HKCU"
+                               Key="Software\dimalinau-lab\DiscordGameFarmer"
+                               Name="DesktopShortcutInstalled"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <Feature Id="MainFeature" Title="Discord Game Activity Manager" Level="1">
+            <ComponentRef Id="MainExecutable" />
+            <ComponentRef Id="DummyGameExecutable" />
+            <ComponentRef Id="LicenseFile" />
+            <ComponentRef Id="StartMenuShortcutComponent" />
+            <ComponentRef Id="DesktopShortcutComponent" />
+        </Feature>
+
+    </Product>
+</Wix>

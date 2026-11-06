@@ -58,7 +58,7 @@ impl DiscordIpc {
         Ok(())
     }
 
-    pub fn set_activity(&mut self, app_id: &str, details: &str, state: &str) {
+    pub fn set_activity(&mut self, app_id: &str, details: &str, state: &str, pid: Option<u32>) {
         if app_id.is_empty() {
             return;
         }
@@ -75,16 +75,19 @@ impl DiscordIpc {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
+            let process_pid = pid.unwrap_or_else(std::process::id);
+
             let payload = json!({
                 "cmd": "SET_ACTIVITY",
                 "args": {
-                    "pid": std::process::id(),
+                    "pid": process_pid,
                     "activity": {
                         "details": details,
                         "state": state,
                         "timestamps": {
                             "start": start_ts
-                        }
+                        },
+                        "instance": true
                     }
                 },
                 "nonce": format!("{}", start_ts)

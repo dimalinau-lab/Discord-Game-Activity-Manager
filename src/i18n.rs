@@ -35,6 +35,7 @@ impl UiScale {
     }
 }
 
+#[allow(dead_code)]
 pub struct I18n {
     pub title: &'static str,
     pub active_single: &'static str,
@@ -83,13 +84,29 @@ pub struct I18n {
     pub active_tag: &'static str,
     pub random_title: &'static str,
     pub random_desc: &'static str,
+    #[allow(dead_code)]
     pub random_batch_label: &'static str,
+    #[allow(dead_code)]
     pub random_batch_suffix: &'static str,
+    #[allow(dead_code)]
+    pub random_interval_label: &'static str,
+    #[allow(dead_code)]
+    pub random_interval_hint: &'static str,
     #[allow(dead_code)]
     pub random_rare_only: &'static str,
     pub btn_start_random: &'static str,
     pub btn_change_random: &'static str,
     pub farmed_count: &'static str,
+    pub btn_replace_game: &'static str,
+    pub broadcasting_badge: &'static str,
+    pub running_badge: &'static str,
+    pub btn_reset_farmed: &'static str,
+    pub fav_tab_filter: &'static str,
+    pub fav_mode_all: &'static str,
+    pub fav_mode_only: &'static str,
+    pub fav_empty_msg: &'static str,
+    #[allow(dead_code)]
+    pub fav_pool_label: &'static str,
 }
 
 pub fn get_i18n(lang: Language) -> I18n {
@@ -142,10 +159,21 @@ pub fn get_i18n(lang: Language) -> I18n {
             random_desc: "Приложение выбирает игры из официальной базы Discord и Steam, запускает их параллельно и сменяет каждые {} мин.",
             random_batch_label: "Запускать одновременно:",
             random_batch_suffix: " игр (рекомендуется 8)",
+            random_interval_label: "Время ротации пачки:",
+            random_interval_hint: "(рекомендуется 15 мин для 100% зачёта)",
             random_rare_only: "Исключать мейнстрим (без Dota/GTA/CS - только редкие игры)",
             btn_start_random: "СТАРТ ПРОКАЧКИ ЗНАЧКА",
             btn_change_random: "СМЕНИТЬ ПАЧКУ ИГР",
             farmed_count: "Прокачано уникальных игр: {}",
+            btn_replace_game: "Сменить",
+            broadcasting_badge: "В эфире",
+            running_badge: "Активно",
+            btn_reset_farmed: "Сброс",
+            fav_tab_filter: "Только избранные",
+            fav_mode_all: "Вся база (24 970 игр)",
+            fav_mode_only: "Только избранные",
+            fav_empty_msg: "В избранном пока нет игр. Отметьте звёздочкой в первой вкладке!",
+            fav_pool_label: "Пул игр для ротации:",
         },
         Language::Uk => I18n {
             title: "Discord Game Activity Manager",
@@ -195,10 +223,21 @@ pub fn get_i18n(lang: Language) -> I18n {
             random_desc: "Програма обирає ігри з офіційної бази Discord та Steam, запускає їх паралельно та змінює кожні {} хв.",
             random_batch_label: "Запускати одночасно:",
             random_batch_suffix: " ігор (рекомендовано 8)",
+            random_interval_label: "Час ротації пачки:",
+            random_interval_hint: "(рекомендовано 15 хв для 100% зарахування)",
             random_rare_only: "Виключати мейнстрім (без Dota/GTA/CS - тільки рідкісні ігри)",
             btn_start_random: "СТАРТ ПРОКАЧКИ ЗНАЧКА",
             btn_change_random: "ЗМІНИТИ ПАЧКУ ІГОР",
             farmed_count: "Прокачано унікальних ігор: {}",
+            btn_replace_game: "Змінити",
+            broadcasting_badge: "В ефірі",
+            running_badge: "Активно",
+            btn_reset_farmed: "Скидання",
+            fav_tab_filter: "Тільки обрані",
+            fav_mode_all: "Вся база (24 970 ігор)",
+            fav_mode_only: "Тільки обрані",
+            fav_empty_msg: "В обраному поки немає ігор. Позначте зірочкою у першій вкладці!",
+            fav_pool_label: "Пул ігор для ротації:",
         },
         Language::En => I18n {
             title: "Discord Game Activity Manager",
@@ -248,10 +287,21 @@ pub fn get_i18n(lang: Language) -> I18n {
             random_desc: "The app randomly selects verified Steam & Discord games, runs them in parallel, and rotates every {} min.",
             random_batch_label: "Run simultaneously:",
             random_batch_suffix: " games (8 recommended)",
+            random_interval_label: "Batch rotation time:",
+            random_interval_hint: "(15 min recommended for 100% credit)",
             random_rare_only: "Exclude mainstream (no Dota/GTA/CS - rare games only)",
             btn_start_random: "START BADGE FARMING",
             btn_change_random: "ROTATE BATCH NOW",
             farmed_count: "Total unique games farmed: {}",
+            btn_replace_game: "Replace",
+            broadcasting_badge: "Live",
+            running_badge: "Active",
+            btn_reset_farmed: "Reset",
+            fav_tab_filter: "Favorites only",
+            fav_mode_all: "All games (24,970)",
+            fav_mode_only: "Favorites only",
+            fav_empty_msg: "No favorite games yet. Mark games with a star in the first tab!",
+            fav_pool_label: "Rotation game pool:",
         },
     }
 }
