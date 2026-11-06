@@ -693,7 +693,7 @@ impl GameFarmerApp {
                 self.is_running = true;
                 self.batch_started_at = Some(Instant::now());
                 self.add_log(&format!(
-                    "Запущена игра '{}' на {} мин. (Процесс [PID {}] + Discord IPC активность)",
+                    "Запущена игра '{}' на {} мин. (Процесс [PID {}] запущен скрытно в фоне, 0% CPU)",
                     name, self.interval_minutes, child_pid
                 ));
             }
@@ -850,10 +850,9 @@ impl GameFarmerApp {
         self.is_running = true;
         self.batch_started_at = Some(Instant::now());
         self.add_log(&format!(
-            "Запущен рандом: {} игр параллельно на {} мин. ({})",
+            "Запущен рандом: {} игр параллельно на {} мин. Все процессы запущены скрытно в фоне (0% CPU, проверить можно в Диспетчере задач)",
             self.running_processes.len(),
-            self.interval_minutes,
-            launched_names.join(", ")
+            self.interval_minutes
         ));
     }
 
@@ -1279,12 +1278,12 @@ impl eframe::App for GameFarmerApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0));
 
                 active_frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let total_w = ui.available_width();
-                        let btn_w = 120.0;
-                        let text_w = (total_w - btn_w - 14.0).max(100.0);
+                    let total_w = ui.available_width();
+                    let btn_w = 120.0;
+                    let text_w = (total_w - btn_w - 16.0).max(100.0);
 
-                        // 1. Левая часть: текстовая информация (компактная, строго 32px по высоте)
+                    ui.horizontal(|ui| {
+                        // 1. Левая часть: текстовая информация
                         ui.allocate_ui_with_layout(
                             Vec2::new(text_w, 32.0),
                             egui::Layout::left_to_right(egui::Align::Center),
@@ -1325,23 +1324,34 @@ impl eframe::App for GameFarmerApp {
                             },
                         );
 
-                        // 2. Правая часть: кнопка «Остановить» прижата к правому краю карточки
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let stop_btn = egui::Button::new(
-                                RichText::new(t.btn_stop)
-                                    .size(11.5)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(218, 55, 60))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(240, 80, 85)))
-                            .rounding(Rounding::same(4.0));
+                        // 2. Распорка для выталкивания кнопки Остановить строго вправо без вертикального растяжения
+                        let remaining_w = ui.available_width() - btn_w;
+                        if remaining_w > 0.0 {
+                            ui.add_space(remaining_w);
+                        }
 
-                            if ui.add_sized(Vec2::new(btn_w, 28.0), stop_btn).clicked() {
-                                self.stop_farming();
-                            }
-                        });
+                        let stop_btn = egui::Button::new(
+                            RichText::new(t.btn_stop)
+                                .size(11.5)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(218, 55, 60))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(240, 80, 85)))
+                        .rounding(Rounding::same(4.0));
+
+                        if ui.add_sized(Vec2::new(btn_w, 28.0), stop_btn).clicked() {
+                            self.stop_farming();
+                        }
                     });
+
+                    ui.add_space(3.0);
+                    // Уведомление о тихом фоновом запуске без окон и иконок в панели задач
+                    ui.label(
+                        RichText::new(t.silent_running_hint)
+                            .size(10.0)
+                            .color(Color32::from_rgb(130, 185, 145)),
+                    );
 
                     // Countdown & progress bar
                     let total_secs = (self.interval_minutes as u64) * 60;
@@ -2015,6 +2025,13 @@ impl eframe::App for GameFarmerApp {
                                         ui.add_space(8.0);
                                         ui.add(egui::ProgressBar::new(progress).desired_width(180.0));
                                     });
+
+                                    ui.add_space(3.0);
+                                    ui.label(
+                                        RichText::new(t.silent_running_hint)
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(130, 185, 145)),
+                                    );
 
                                     ui.add_space(8.0);
 
