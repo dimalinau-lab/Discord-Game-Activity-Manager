@@ -56,18 +56,17 @@ fn main() {
 
         RegisterClassExW(&wnd_class);
 
-        // Скрытое окно (WS_EX_TOOLWINDOW исключает появление кнопки на панели задач и в Alt+Tab;
-        // WS_POPUP и координаты -32000,-32000 исключают показ окна на экране.
-        // Окно остаётся зарегистрированным в Win32 и определяется Discord.
+        // Компактное окно 320x200 (WS_EX_APPWINDOW + SW_SHOWNOACTIVATE: как в рабочей версии до 07.11,
+        // гарантирует распознавание процесса и окна в Discord RunningGameStore без перехвата фокуса)
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_APPWINDOW,
             class_name.as_ptr(),
             window_title.as_ptr(),
-            WS_POPUP,
-            -32000,
-            -32000,
-            1,
-            1,
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            320,
+            200,
             0,
             0,
             instance,
@@ -75,7 +74,9 @@ fn main() {
         );
 
         if hwnd != 0 {
-            ShowWindow(hwnd, SW_HIDE);
+            // SW_SHOWNOACTIVATE (4): окно видимо для Discord (IsWindowVisible == TRUE, !IsIconic),
+            // но не перехватывает фокус пользователя.
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
 
         // Легковесный цикл обработки сообщений Windows (0% CPU, ~1-2 МБ RAM)

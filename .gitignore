@@ -9,6 +9,7 @@ Cargo.lock
 # Installers & Distribution (Установщики)
 # ==========================================
 dist/
+dist_release/
 Output/
 installer.iss
 *.iss

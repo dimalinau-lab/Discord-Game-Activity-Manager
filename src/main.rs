@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use chrono::Local;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
@@ -10,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 // Вшитая база данных всех 25 887 игр Discord
 const GAMES_DB_RAW: &str = include_str!("../games_db.json");
+
+// Вшитый исполняемый файл процесса-заглушки (для автономной работы без зависимостей)
+const EMBEDDED_DUMMY_GAME: &[u8] = include_bytes!("../target/release/dummy_game.exe");
 
 #[cfg(windows)]
 fn get_running_process_names() -> HashSet<String> {
@@ -87,6 +92,9 @@ use discord_ipc::DiscordIpc;
 
 mod updater;
 use updater::{AutoUpdater, UpdateStatus};
+
+mod quest_api;
+mod anti_pause;
 
 #[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -279,6 +287,14 @@ struct GameFarmerApp {
     // IPC клиент Discord Rich Presence
     discord_ipc: DiscordIpc,
 
+    // Автоматический Heartbeat для квестов Discord
+    discord_token: Option<String>,
+    quest_stop_signal: Option<Arc<AtomicBool>>,
+    quest_log_sender: std::sync::mpsc::Sender<String>,
+    quest_log_receiver: std::sync::mpsc::Receiver<String>,
+    active_quest_status: Option<String>,
+    anti_pause_active: bool,
+
     // Автообновление
     updater: AutoUpdater,
 }
@@ -310,6 +326,8 @@ impl Default for GameFarmerApp {
             total_db_count
         )];
 
+        let (quest_log_sender, quest_log_receiver) = std::sync::mpsc::channel();
+
         Self {
             job_object: ProcessJob::new(),
             language: loaded_settings.language,
@@ -337,6 +355,12 @@ impl Default for GameFarmerApp {
             logs,
             saved_settings: loaded_settings,
             discord_ipc: DiscordIpc::new(),
+            discord_token: quest_api::extract_discord_token(),
+            quest_stop_signal: None,
+            quest_log_sender,
+            quest_log_receiver,
+            active_quest_status: None,
+            anti_pause_active: anti_pause::is_anti_pause_installed(),
             updater,
         }
     }
@@ -408,7 +432,9 @@ fn game_matches_query(name: &str, exe: &str, raw_query: &str) -> bool {
     if q.contains("орб") || q.contains("orb") || q.contains("квест") || q.contains("quest") {
         let quest_titles = [
             "modern warfare 4", "sp26-cod", "world of warcraft: forever", "wowb",
-            "where winds meet", "wwm", "99 nights in the forest", "robloxplayerbeta",
+            "where winds meet", "wwm", "basketball null", "basketball", "firefox browser", "firefox",
+            "99 nights in the forest", "doors on roblox", "clean crew on roblox", "robloxplayerbeta",
+            "kobayashi", "magic: the gathering", "mtga",
             "delta force", "arc raiders", "pioneer", "arena breakout",
             "escape the backrooms", "the finals", "marvel rivals", "monster hunter wilds",
             "black ops 6", "genshin", "honkai", "star rail", "zenless", "wuthering",
@@ -416,6 +442,28 @@ fn game_matches_query(name: &str, exe: &str, raw_query: &str) -> bool {
             "valorant", "league of legends"
         ];
         if quest_titles.iter().any(|k| name_lower.contains(k) || exe_lower.contains(k)) {
+            return true;
+        }
+    }
+
+    if q.contains("баскет") || q.contains("basket") {
+        if name_lower.contains("basketball") {
+            return true;
+        }
+    }
+
+    if q == "лиса" || q.contains("фаерфокс") || q.contains("файрфокс") || q.contains("firefox") {
+        if name_lower.contains("firefox") || exe_lower.contains("firefox") {
+            return true;
+        }
+    }
+
+    if q.contains("koba") || q.contains("коба") || q.contains("maru") || q.contains("мару")
+        || q.contains("star trek") || q.contains("стартрек") || q.contains("стар трек")
+        || q.contains("trek") || q.contains("трек")
+        || q == "mtg" || q == "мтг" || q.contains("magic") || q.contains("мэджик")
+    {
+        if name_lower.contains("kobayashi") || name_lower.contains("magic: the gathering") || exe_lower.contains("mtga") {
             return true;
         }
     }
@@ -590,6 +638,10 @@ impl GameFarmerApp {
                 if candidate.exists() {
                     return Some(candidate);
                 }
+                // Автоматическое самоизвлечение встроенного dummy_game.exe
+                if std::fs::write(&candidate, EMBEDDED_DUMMY_GAME).is_ok() {
+                    return Some(candidate);
+                }
             }
         }
         let debug_path = Path::new("target/debug/dummy_game.exe");
@@ -607,8 +659,100 @@ impl GameFarmerApp {
         None
     }
 
+    fn clean_exe_name(exe: &str) -> String {
+        exe.trim().replace(['<', '>'], "")
+    }
+
+    /// Проверяет, что запись указывает на исполняемый .exe, распознаваемый Discord RunningGameStore.
+    fn is_detectable_win_exe(exe: &str) -> bool {
+        let clean = Self::clean_exe_name(exe);
+        !clean.is_empty() && clean.to_lowercase().ends_with(".exe")
+    }
+
+    /// Всегда хранит stubs рядом с исполняемым файлом, независимо от текущей рабочей директории.
+    fn resolve_stubs_dir() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("stubs")))
+            .unwrap_or_else(|| PathBuf::from("stubs"))
+    }
+
+    /// Проверяет побайтовое совпадение двух файлов (при равном размере).
+    fn files_identical(a: &Path, b: &Path) -> bool {
+        let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+            return false;
+        };
+        if ma.len() != mb.len() {
+            return false;
+        }
+        matches!((std::fs::read(a), std::fs::read(b)), (Ok(ba), Ok(bb)) if ba == bb)
+    }
+
+    /// Копирует `dummy_exe` в `stub_path`, если заглушка отсутствует или отличается от актуального билда.
+    fn sync_stub_file(dummy_exe: &Path, stub_path: &Path) -> bool {
+        if let Some(parent) = stub_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if Self::files_identical(stub_path, dummy_exe) {
+            return false;
+        }
+        std::fs::copy(dummy_exe, stub_path).is_ok()
+    }
+
+    /// Готовит копию dummy_game.exe с именем целевого Win32 .exe игры; иначе возвращает dummy_exe.
+    fn prepare_game_stub(dummy_exe: &Path, clean_exe: &str) -> PathBuf {
+        if !Self::is_detectable_win_exe(clean_exe) {
+            return dummy_exe.to_path_buf();
+        }
+        let stubs_dir = Self::resolve_stubs_dir();
+        let stub_path = stubs_dir.join(clean_exe);
+        let _ = Self::sync_stub_file(dummy_exe, &stub_path);
+        stub_path
+    }
+
+    /// Подбирает кандидатов для пачки: только игры с валидным App ID и Win32 .exe.
+    fn batch_candidates(&self, exclude_names: Option<&HashSet<String>>) -> (Vec<DbGame>, Vec<String>) {
+        let mut excluded_on_pc = Vec::new();
+        let candidates = self
+            .all_games
+            .iter()
+            .filter(|g| exclude_names.map_or(true, |set| !set.contains(&g.name)))
+            .filter(|g| {
+                if self.random_only_favorites
+                    && !self.favorite_games.is_empty()
+                    && !self.favorite_games.contains(&g.name)
+                {
+                    return false;
+                }
+                if g.id.is_empty() || !Self::is_detectable_win_exe(&g.exe) {
+                    return false;
+                }
+                let clean = Self::clean_exe_name(&g.exe);
+                let exe_lower = Path::new(&clean)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&clean)
+                    .to_lowercase();
+
+                if self.exclude_running_pc_games && self.detected_pc_processes.contains(&exe_lower) {
+                    if !excluded_on_pc.contains(&exe_lower) {
+                        excluded_on_pc.push(exe_lower);
+                    }
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        (candidates, excluded_on_pc)
+    }
+
     /// Остановка ВСЕХ запущенных процессов
     fn stop_all_active_games(&mut self) {
+        self.active_quest_status = None;
+        if let Some(sig) = self.quest_stop_signal.take() {
+            sig.store(true, Ordering::Relaxed);
+        }
         for mut rp in self.running_processes.drain(..) {
             let _ = rp.child.kill();
             let _ = rp.child.wait();
@@ -645,23 +789,14 @@ impl GameFarmerApp {
             }
         };
 
-        let clean_exe = exe.trim().replace(['<', '>'], "");
-        let target_stub = if !clean_exe.is_empty() {
-            let stubs_dir = Path::new("stubs");
-            let stub_path = stubs_dir.join(&clean_exe);
-            if let Some(parent) = stub_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let need_copy = !stub_path.exists()
-                || std::fs::metadata(&stub_path).map(|m| m.len()).unwrap_or(0)
-                    != std::fs::metadata(&dummy_exe).map(|m| m.len()).unwrap_or(0);
-            if need_copy {
-                let _ = std::fs::copy(&dummy_exe, &stub_path);
-            }
-            stub_path
-        } else {
-            dummy_exe
-        };
+        let clean_exe = Self::clean_exe_name(&exe);
+        let target_stub = Self::prepare_game_stub(&dummy_exe, &clean_exe);
+        if !Self::is_detectable_win_exe(&clean_exe) {
+            self.add_log(&format!(
+                "Внимание: у '{}' нет Win32 .exe ('{}') — Discord увидит только IPC статус, но не процесс для значка/квеста.",
+                name, clean_exe
+            ));
+        }
 
         let mut cmd = Command::new(&target_stub);
         if let Some(parent) = target_stub.parent() {
@@ -696,6 +831,42 @@ impl GameFarmerApp {
                     "Запущена игра '{}' на {} мин. (Процесс [PID {}] запущен скрытно в фоне, 0% CPU)",
                     name, self.interval_minutes, child_pid
                 ));
+
+                // 3. Автоматическая фоновая отправка Heartbeat для квестов Discord
+                if !app_id.is_empty() {
+                    if self.discord_token.is_none() {
+                        self.discord_token = quest_api::extract_discord_token();
+                    }
+                    let token_opt = self.discord_token.clone();
+                    if let Some(token) = token_opt {
+                        if let Some(quest) = quest_api::get_enrolled_quest(&token, &app_id, &clean_title) {
+                            if quest.completed {
+                                self.add_log(&format!(
+                                    "✨ Квест Discord '{}' уже завершен на 100%! Заберите награду в Discord.",
+                                    quest.quest_name
+                                ));
+                            } else {
+                                self.add_log(&format!(
+                                    "🎯 Квест Discord '{}' активен! Включена авто-отправка прогресса (Heartbeat API, текущий: {}/{} сек).",
+                                    quest.quest_name, quest.current_seconds, quest.target_seconds
+                                ));
+                                let stop_sig = Arc::new(AtomicBool::new(false));
+                                quest_api::spawn_quest_heartbeat_worker(
+                                    token,
+                                    quest,
+                                    Arc::clone(&stop_sig),
+                                    self.quest_log_sender.clone(),
+                                );
+                                self.quest_stop_signal = Some(stop_sig);
+                            }
+                        } else if let Some(un_quest_name) = quest_api::get_unenrolled_quest_name(&token, &app_id, &clean_title) {
+                            self.add_log(&format!(
+                                "⚠️ Внимание: Для игры '{}' есть квест в Discord ('{}'), но он еще не принят! Нажмите «Принять задание» в Discord и перезапустите таймер.",
+                                clean_title, un_quest_name
+                            ));
+                        }
+                    }
+                }
             }
             Err(e) => {
                 self.add_log(&format!("Ошибка запуска процесса {}: {}", clean_exe, e));
@@ -725,34 +896,7 @@ impl GameFarmerApp {
 
         self.detected_pc_processes = get_running_process_names();
 
-        let mut excluded_on_pc = Vec::new();
-        let candidates: Vec<DbGame> = self
-            .all_games
-            .iter()
-            .filter(|g| {
-                if self.random_only_favorites && !self.favorite_games.is_empty() && !self.favorite_games.contains(&g.name) {
-                    return false;
-                }
-                if g.exe.is_empty() {
-                    return true;
-                }
-                let exe_lower = Path::new(&g.exe)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or(&g.exe)
-                    .to_lowercase();
-
-                if self.exclude_running_pc_games && self.detected_pc_processes.contains(&exe_lower) {
-                    if !excluded_on_pc.contains(&exe_lower) {
-                        excluded_on_pc.push(exe_lower);
-                    }
-                    return false;
-                }
-
-                true
-            })
-            .cloned()
-            .collect();
+        let (candidates, excluded_on_pc) = self.batch_candidates(None);
 
         if !excluded_on_pc.is_empty() {
             self.add_log(&format!(
@@ -776,13 +920,14 @@ impl GameFarmerApp {
         let picked: Vec<DbGame> = unvisited.into_iter().take(self.batch_size).collect();
 
         if picked.is_empty() {
-            self.add_log("Не найдено подходящих игр для запуска.");
+            if self.random_only_favorites && !self.favorite_games.is_empty() {
+                self.add_log("В избранном нет игр с .exe из базы Discord (без .exe значок Discord не засчитывает).");
+            } else {
+                self.add_log("Не найдено подходящих игр с .exe для запуска.");
+            }
             self.is_running = false;
             return;
         }
-
-        let stubs_dir = Path::new("stubs");
-        let _ = std::fs::create_dir_all(stubs_dir);
 
         let mut launched_names = Vec::new();
         let mut first_game_id = None;
@@ -795,22 +940,8 @@ impl GameFarmerApp {
                 first_game_name = Some(db_game.name.clone());
             }
 
-            let clean_exe = db_game.exe.trim().replace(['<', '>'], "");
-            let target_stub = if !clean_exe.is_empty() {
-                let stub_path = stubs_dir.join(&clean_exe);
-                if let Some(parent) = stub_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let need_copy = !stub_path.exists()
-                    || std::fs::metadata(&stub_path).map(|m| m.len()).unwrap_or(0)
-                        != std::fs::metadata(&dummy_exe).map(|m| m.len()).unwrap_or(0);
-                if need_copy {
-                    let _ = std::fs::copy(&dummy_exe, &stub_path);
-                }
-                stub_path
-            } else {
-                dummy_exe.clone()
-            };
+            let clean_exe = Self::clean_exe_name(&db_game.exe);
+            let target_stub = Self::prepare_game_stub(&dummy_exe, &clean_exe);
 
             let mut cmd = Command::new(&target_stub);
             if let Some(parent) = target_stub.parent() {
@@ -819,24 +950,33 @@ impl GameFarmerApp {
 
             cmd.arg(&db_game.name);
 
-            if let Ok(child) = cmd.spawn() {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::io::AsRawHandle;
-                    self.job_object.assign(child.as_raw_handle());
+            match cmd.spawn() {
+                Ok(child) => {
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::io::AsRawHandle;
+                        self.job_object.assign(child.as_raw_handle());
+                    }
+                    launched_names.push(db_game.name.clone());
+                    self.running_processes.push(RunningProcess {
+                        game: ActiveGame {
+                            name: db_game.name.clone(),
+                            exe_name: clean_exe,
+                            app_id: db_game.id.clone(),
+                            window_title: db_game.name,
+                        },
+                        child,
+                        stub_path: target_stub,
+                    });
                 }
-                launched_names.push(db_game.name.clone());
-                self.running_processes.push(RunningProcess {
-                    game: ActiveGame {
-                        name: db_game.name.clone(),
-                        exe_name: clean_exe,
-                        app_id: db_game.id.clone(),
-                        window_title: db_game.name,
-                    },
-                    child,
-                    stub_path: target_stub,
-                });
+                Err(e) => {
+                    self.add_log(&format!("Ошибка запуска '{}' ({}): {}", db_game.name, clean_exe, e));
+                }
             }
+        }
+
+        if self.interval_minutes < 6 {
+            self.add_log("Внимание: Discord отправляет heartbeat раз в 5 мин — интервал < 6 мин может не засчитаться в значок.");
         }
 
         self.current_ipc_index = 0;
@@ -903,42 +1043,11 @@ impl GameFarmerApp {
         let mut rng = rand::thread_rng();
 
         let running_names: HashSet<String> = self.running_processes.iter().map(|rp| rp.game.name.clone()).collect();
-        let candidates: Vec<DbGame> = self
-            .all_games
-            .iter()
-            .filter(|g| !running_names.contains(&g.name))
-            .filter(|g| {
-                if self.random_only_favorites && !self.favorite_games.is_empty() && !self.favorite_games.contains(&g.name) {
-                    return false;
-                }
-                if g.exe.is_empty() {
-                    return true;
-                }
-                let exe_lower = Path::new(&g.exe)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or(&g.exe)
-                    .to_lowercase();
-
-                if self.exclude_running_pc_games && self.detected_pc_processes.contains(&exe_lower) {
-                    return false;
-                }
-                true
-            })
-            .cloned()
-            .collect();
+        let (candidates, _) = self.batch_candidates(Some(&running_names));
 
         if let Some(new_game) = candidates.choose(&mut rng) {
-            let clean_exe = new_game.exe.trim().replace(['<', '>'], "");
-            let stubs_dir = Path::new("stubs");
-            let target_stub = if !clean_exe.is_empty() {
-                let stub_path = stubs_dir.join(&clean_exe);
-                let _ = std::fs::create_dir_all(stub_path.parent().unwrap_or_else(|| Path::new(".")));
-                let _ = std::fs::copy(&dummy_exe, &stub_path);
-                stub_path
-            } else {
-                dummy_exe
-            };
+            let clean_exe = Self::clean_exe_name(&new_game.exe);
+            let target_stub = Self::prepare_game_stub(&dummy_exe, &clean_exe);
 
             let mut cmd = Command::new(&target_stub);
             if let Some(parent) = target_stub.parent() {
@@ -975,9 +1084,50 @@ impl GameFarmerApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_stub_file_refreshes_same_size_stale_stub() {
+        let dir = std::env::temp_dir().join(format!("dgf_stub_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dummy = dir.join("dummy_game.exe");
+        let stub = dir.join("sub/hero_siege.exe");
+        std::fs::write(&dummy, b"NEW_STUB_DATA_V2").unwrap();
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+        std::fs::write(&stub, b"OLD_STUB_DATA_V1").unwrap();
+
+        // Same 16-byte length, different bytes: must overwrite
+        assert!(GameFarmerApp::sync_stub_file(&dummy, &stub));
+        assert_eq!(std::fs::read(&stub).unwrap(), b"NEW_STUB_DATA_V2");
+
+        // Identical content: no redundant copy
+        assert!(!GameFarmerApp::sync_stub_file(&dummy, &stub));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detectable_win_exe_filter() {
+        assert!(GameFarmerApp::is_detectable_win_exe("hero_siege.exe"));
+        assert!(GameFarmerApp::is_detectable_win_exe("bin/x64/cyberpunk2077.exe"));
+        assert!(!GameFarmerApp::is_detectable_win_exe(""));
+        assert!(!GameFarmerApp::is_detectable_win_exe("game.app/Contents/MacOS/game"));
+    }
+}
+
 impl eframe::App for GameFarmerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(200));
+
+        // Прием логов из фонового Heartbeat API воркера квестов
+        while let Ok(msg) = self.quest_log_receiver.try_recv() {
+            self.active_quest_status = Some(msg.clone());
+            self.add_log(&msg);
+        }
 
         // Опрос статуса автообновления
         if let Some(log_msg) = self.updater.poll() {
@@ -1391,6 +1541,24 @@ impl eframe::App for GameFarmerApp {
                         .fill(Color32::from_rgb(35, 165, 90))
                         .show_percentage();
                     ui.add(pbar);
+
+                    if let Some(ref q_status) = self.active_quest_status {
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("🎯 Квест Discord:")
+                                    .size(10.5)
+                                    .strong()
+                                    .color(Color32::from_rgb(180, 220, 255)),
+                            );
+                            ui.label(
+                                RichText::new(q_status)
+                                    .size(10.5)
+                                    .strong()
+                                    .color(Color32::from_rgb(100, 255, 180)),
+                            );
+                        });
+                    }
                 });
             }
 
@@ -1863,6 +2031,20 @@ impl eframe::App for GameFarmerApp {
                                     ui.add(egui::Slider::new(&mut self.interval_minutes, 1..=20).suffix(" мин"));
                                 });
 
+                                if self.interval_minutes < 6 {
+                                    ui.add_space(4.0);
+                                    let warn_msg = match self.language {
+                                        Language::Ru => "⚠ Discord шлёт heartbeat раз в 5 мин — для значка ставьте ≥ 6 мин (лучше 10–15 мин).",
+                                        Language::Uk => "⚠ Discord шле heartbeat раз на 5 хв — для значка ставте ≥ 6 хв (краще 10–15 хв).",
+                                        Language::En => "⚠ Discord sends heartbeats every 5 min — use ≥ 6 min (10–15 min recommended) for badge tracking.",
+                                    };
+                                    ui.label(
+                                        RichText::new(warn_msg)
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(240, 185, 60)),
+                                    );
+                                }
+
                                 ui.add_space(8.0);
                                 ui.separator();
                                 ui.add_space(8.0);
@@ -2237,6 +2419,82 @@ impl eframe::App for GameFarmerApp {
                             RichText::new(t.protect_pc)
                                 .size(11.5)
                                 .color(Color32::from_rgb(210, 210, 210)),
+                        );
+
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+
+                        // 3.5. Анти-пауза видео Discord (Промо-ролики для Орбсов)
+                        ui.label(
+                            RichText::new("Анти-пауза видео Discord (Орбсы без остановки)")
+                                .size(12.0)
+                                .strong()
+                                .color(Color32::from_rgb(200, 200, 200)),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let (btn_text, btn_fill, btn_stroke) = if self.anti_pause_active {
+                                ("Отключить анти-паузу видео", Color32::from_rgb(180, 50, 50), Color32::from_rgb(220, 70, 70))
+                            } else {
+                                ("Включить анти-паузу видео Discord", Color32::from_rgb(35, 165, 90), Color32::from_rgb(50, 200, 110))
+                            };
+
+                            let ap_btn = egui::Button::new(
+                                RichText::new(btn_text)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(btn_fill)
+                            .stroke(Stroke::new(1.0_f32, btn_stroke))
+                            .rounding(Rounding::same(4.0));
+
+                            if ui.add_sized(Vec2::new(260.0, 28.0), ap_btn).clicked() {
+                                if self.anti_pause_active {
+                                    match anti_pause::uninstall_anti_pause() {
+                                        Ok(_) => {
+                                            self.anti_pause_active = false;
+                                            self.add_log("Анти-пауза видео отключена. Перезапустите Discord.");
+                                        }
+                                        Err(e) => {
+                                            self.add_log(&format!("Ошибка отключения анти-паузы: {}", e));
+                                        }
+                                    }
+                                } else {
+                                    match anti_pause::install_anti_pause() {
+                                        Ok(_) => {
+                                            self.anti_pause_active = true;
+                                            self.add_log("✅ Анти-пауза видео включена! Перезапустите Discord для активации.");
+                                        }
+                                        Err(e) => {
+                                            self.add_log(&format!("Ошибка включения анти-паузы: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if self.anti_pause_active {
+                                ui.label(
+                                    RichText::new("● АКТИВНО (видео не останавливается)")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(50, 225, 110)),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("● Не активно")
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(140, 145, 155)),
+                                );
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Позволяет свернуть Discord или переключиться на другие программы: промо-видео и ролики для Орбсов продолжают идти в фоне без остановки.")
+                                .size(10.5)
+                                .color(Color32::from_rgb(150, 165, 180)),
                         );
 
                         ui.add_space(16.0);

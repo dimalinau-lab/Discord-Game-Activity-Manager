@@ -1,5 +1,10 @@
 [
   {
+    "name": "Beat the Kobayashi Maru (Magic: The Gathering)",
+    "exe": "mtga.exe",
+    "id": "505142532297064468"
+  },
+  {
     "name": "BLUD",
     "exe": "",
     "id": "1440131275427020890"
@@ -124848,5 +124853,25 @@
     "name": "CITY DESTRUCTION",
     "exe": "",
     "id": "1411666885405048904"
+  },
+  {
+    "name": "Basketball Null on Roblox",
+    "exe": "robloxplayerbeta.exe",
+    "id": "363445589247131668"
+  },
+  {
+    "name": "Firefox Browser",
+    "exe": "firefox.exe",
+    "id": "1491208267928703226"
+  },
+  {
+    "name": "Doors on Roblox",
+    "exe": "robloxplayerbeta.exe",
+    "id": "363445589247131668"
+  },
+  {
+    "name": "Clean Crew on Roblox",
+    "exe": "robloxplayerbeta.exe",
+    "id": "363445589247131668"
   }
 ]

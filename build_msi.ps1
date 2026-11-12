@@ -33,7 +33,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # 3. Сборка MSI установщика через WiX
 Write-Host "[3/3] Упаковка в MSI через WiX Toolset..." -ForegroundColor Green
-$Version = "0.2.8"
+$Version = "0.2.9"
 $targetDir = Join-Path $scriptDir "target"
 $wixObj = Join-Path $targetDir "main.wixobj"
 $msiOut = Join-Path $targetDir "DiscordGameFarmer-v$Version-x64.msi"
