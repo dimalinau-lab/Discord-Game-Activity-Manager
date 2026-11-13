@@ -2496,6 +2496,12 @@ impl eframe::App for GameFarmerApp {
                                 .size(10.5)
                                 .color(Color32::from_rgb(150, 165, 180)),
                         );
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("⚠️ После включения или отключения обязательно полностью перезапустите Discord (через трей или диспетчер задач).")
+                                .size(10.5)
+                                .color(Color32::from_rgb(225, 180, 80)),
+                        );
 
                         ui.add_space(16.0);
                         ui.separator();

@@ -11,17 +11,20 @@ const ANTI_PAUSE_SCRIPT = `
         if (window.__discordAntiPauseInjected) return;
         window.__discordAntiPauseInjected = true;
 
-        Object.defineProperty(document, 'hidden', {
-            get: () => false,
-            configurable: true
-        });
-        Object.defineProperty(document, 'visibilityState', {
-            get: () => 'visible',
-            configurable: true
-        });
+        // 1. Постоянная видимость вкладки и наличие фокуса
+        try {
+            Object.defineProperty(document, 'hidden', {
+                get: () => false,
+                configurable: true
+            });
+            Object.defineProperty(document, 'visibilityState', {
+                get: () => 'visible',
+                configurable: true
+            });
+            document.hasFocus = () => true;
+        } catch (_) {}
 
-        document.hasFocus = () => true;
-
+        // 2. Блокировка событий потери фокуса в DOM
         const originalAddEventListener = EventTarget.prototype.addEventListener;
         EventTarget.prototype.addEventListener = function(type, listener, options) {
             if ((this === window || this === document) && 
@@ -36,31 +39,79 @@ const ANTI_PAUSE_SCRIPT = `
             document.addEventListener(evt, e => e.stopImmediatePropagation(), true);
         });
 
+        // 3. Блокировка программного вызова pause() у видеоэлементов (React effects, stores)
         const origPause = HTMLVideoElement.prototype.pause;
         HTMLVideoElement.prototype.pause = function(...args) {
-            const stack = (new Error()).stack || '';
-            if (stack.includes('blur') || stack.includes('visibility') || stack.includes('focus') || !document.hasFocus()) {
+            const evt = window.event;
+            const isUserAction = evt && (evt.type === 'click' || evt.type === 'keydown' || evt.type === 'pointerup');
+            if (!isUserAction) {
+                console.log('[DiscordGameFarmer] Авто-пауза видео заблокирована');
                 return;
             }
             return origPause.apply(this, args);
         };
 
+        // 4. Авто-возобновление воспроизведения, если видео всё же приостановлено в фоне
+        document.addEventListener('pause', (e) => {
+            if (e.target instanceof HTMLVideoElement && !e.target.ended) {
+                const evt = window.event;
+                const isUserAction = evt && (evt.type === 'click' || evt.type === 'keydown' || evt.type === 'pointerup');
+                if (!isUserAction) {
+                    setTimeout(() => {
+                        if (e.target.paused && !e.target.ended) {
+                            e.target.play().catch(() => {});
+                        }
+                    }, 50);
+                }
+            }
+        }, true);
+
         console.log('[DiscordGameFarmer] Анти-пауза видео активна');
     } catch (e) {
-        console.error('[DiscordGameFarmer] Ошибка:', e);
+        console.error('[DiscordGameFarmer] Ошибка инициализации анти-паузы:', e);
     }
 })();
 `;
 
+function setupWindow(win) {
+    if (!win || !win.webContents || win.__antiPauseConfigured) return;
+    win.__antiPauseConfigured = true;
+
+    // Отключаем фоновый троттлинг таймеров и видео в Electron
+    try {
+        if (typeof win.webContents.setBackgroundThrottling === 'function') {
+            win.webContents.setBackgroundThrottling(false);
+        }
+        win.webContents.backgroundThrottling = false;
+    } catch (_) {}
+
+    // Перехватываем IPC-сообщения главного процесса:
+    // Подменяем MAIN_WINDOW_BLUR и MAIN_WINDOW_HIDDEN на MAIN_WINDOW_FOCUS,
+    // чтобы WindowStore и видеоплеер Discord всегда считали окно активным
+    const origSend = win.webContents.send;
+    win.webContents.send = function(channel, ...args) {
+        if (typeof channel === 'string' && (channel.endsWith('MAIN_WINDOW_BLUR') || channel.endsWith('MAIN_WINDOW_HIDDEN'))) {
+            const focusChannel = channel.replace(/MAIN_WINDOW_(BLUR|HIDDEN)/, 'MAIN_WINDOW_FOCUS');
+            return origSend.call(this, focusChannel, ...args);
+        }
+        return origSend.call(this, channel, ...args);
+    };
+
+    const inject = () => {
+        win.webContents.executeJavaScript(ANTI_PAUSE_SCRIPT).catch(() => {});
+    };
+    win.webContents.on('dom-ready', inject);
+    win.webContents.on('did-finish-load', inject);
+    inject();
+}
+
 if (electron && electron.app) {
     electron.app.on('browser-window-created', (event, win) => {
-        if (!win || !win.webContents) return;
-        const inject = () => {
-            win.webContents.executeJavaScript(ANTI_PAUSE_SCRIPT).catch(() => {});
-        };
-        win.webContents.on('dom-ready', inject);
-        win.webContents.on('did-finish-load', inject);
+        setupWindow(win);
     });
+    if (electron.BrowserWindow && typeof electron.BrowserWindow.getAllWindows === 'function') {
+        electron.BrowserWindow.getAllWindows().forEach(setupWindow);
+    }
 }
 
 module.exports = require('./core.asar');
