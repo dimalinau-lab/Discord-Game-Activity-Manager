@@ -200,3 +200,68 @@ pub fn uninstall_anti_pause() -> Result<(), String> {
     Ok(())
 }
 
+pub fn restart_discord() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let targets = ["Discord.exe", "DiscordCanary.exe", "DiscordPTB.exe", "DiscordDevelopment.exe"];
+        for target in &targets {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/IM", target, "/T"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let launchers = [
+            (format!(r"{}\Discord\Update.exe", local_app_data), "Discord.exe"),
+            (format!(r"{}\DiscordCanary\Update.exe", local_app_data), "DiscordCanary.exe"),
+            (format!(r"{}\DiscordPTB\Update.exe", local_app_data), "DiscordPTB.exe"),
+            (format!(r"{}\DiscordDevelopment\Update.exe", local_app_data), "DiscordDevelopment.exe"),
+        ];
+
+        for (update_exe, proc_name) in &launchers {
+            if std::path::Path::new(update_exe).exists() {
+                Command::new(update_exe)
+                    .args(["--processStart", proc_name])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn()
+                    .map_err(|e| format!("Не удалось запустить Discord через {}: {}", update_exe, e))?;
+                return Ok(());
+            }
+        }
+
+        if let Some(index_path) = find_discord_core_index_js() {
+            let mut curr = index_path.as_path();
+            while let Some(parent) = curr.parent() {
+                if let Some(name) = parent.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("app-") {
+                        let direct_exe = parent.join("Discord.exe");
+                        if direct_exe.exists() {
+                            Command::new(&direct_exe)
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .spawn()
+                                .map_err(|e| format!("Не удалось запустить {}: {}", direct_exe.display(), e))?;
+                            return Ok(());
+                        }
+                    }
+                }
+                curr = parent;
+            }
+        }
+
+        Err("Исполняемый файл Discord не найден в LocalAppData".to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("Перезапуск Discord поддерживается только на Windows".to_string())
+    }
+}
+
+

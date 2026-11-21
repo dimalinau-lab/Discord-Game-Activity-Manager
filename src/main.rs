@@ -95,6 +95,9 @@ use updater::{AutoUpdater, UpdateStatus};
 
 mod quest_api;
 mod anti_pause;
+mod tray;
+
+const ICON_RGBA: &[u8] = include_bytes!("../app_icon_64.rgba");
 
 #[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -108,6 +111,8 @@ pub struct AppSettings {
     pub batch_size: usize,
     #[serde(default = "default_true")]
     pub exclude_running_pc_games: bool,
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
     #[serde(default)]
     pub farmed_history: Vec<String>,
     #[serde(default)]
@@ -130,6 +135,7 @@ impl Default for AppSettings {
             interval_minutes: default_interval_minutes(),
             batch_size: default_batch_size(),
             exclude_running_pc_games: true,
+            minimize_to_tray: true,
             farmed_history: Vec::new(),
             favorite_games: Vec::new(),
             random_only_favorites: false,
@@ -297,6 +303,11 @@ struct GameFarmerApp {
 
     // Автообновление
     updater: AutoUpdater,
+
+    // Системный трей
+    minimize_to_tray: bool,
+    is_quitting: bool,
+    tray_manager: Option<tray::TrayManager>,
 }
 
 impl Default for GameFarmerApp {
@@ -353,7 +364,9 @@ impl Default for GameFarmerApp {
             current_ipc_index: 0,
             last_ipc_rotation: Instant::now(),
             logs,
-            saved_settings: loaded_settings,
+            minimize_to_tray: loaded_settings.minimize_to_tray,
+            is_quitting: false,
+            tray_manager: None,
             discord_ipc: DiscordIpc::new(),
             discord_token: quest_api::extract_discord_token(),
             quest_stop_signal: None,
@@ -362,6 +375,7 @@ impl Default for GameFarmerApp {
             active_quest_status: None,
             anti_pause_active: anti_pause::is_anti_pause_installed(),
             updater,
+            saved_settings: loaded_settings,
         }
     }
 }
@@ -433,7 +447,7 @@ fn game_matches_query(name: &str, exe: &str, raw_query: &str) -> bool {
         let quest_titles = [
             "modern warfare 4", "sp26-cod", "world of warcraft: forever", "wowb",
             "where winds meet", "wwm", "basketball null", "basketball", "firefox browser", "firefox",
-            "99 nights in the forest", "doors on roblox", "clean crew on roblox", "robloxplayerbeta",
+            "99 nights in the forest", "doors on roblox", "clean crew on roblox", "illegal soccer on roblox", "illegal soccer", "robloxplayerbeta",
             "kobayashi", "magic: the gathering", "mtga",
             "delta force", "arc raiders", "pioneer", "arena breakout",
             "escape the backrooms", "the finals", "marvel rivals", "monster hunter wilds",
@@ -448,6 +462,18 @@ fn game_matches_query(name: &str, exe: &str, raw_query: &str) -> bool {
 
     if q.contains("баскет") || q.contains("basket") {
         if name_lower.contains("basketball") {
+            return true;
+        }
+    }
+
+    if q.contains("soccer") || q.contains("соккер") || q.contains("illegal") || q.contains("иллегал") || q.contains("футбол") {
+        if name_lower.contains("illegal soccer") {
+            return true;
+        }
+    }
+
+    if q.contains("roblox") || q.contains("роблокс") {
+        if name_lower.contains("roblox") || exe_lower.contains("roblox") {
             return true;
         }
     }
@@ -622,6 +648,17 @@ fn clean_game_name(raw_name: &str, exe: &str) -> String {
 }
 
 impl GameFarmerApp {
+    pub fn init_tray(&mut self, ctx: egui::Context) {
+        match tray::TrayManager::new(ICON_RGBA, 64, 64, ctx) {
+            Ok(tm) => {
+                self.tray_manager = Some(tm);
+            }
+            Err(e) => {
+                self.add_log(&format!("⚠️ Системный трей: {}", e));
+            }
+        }
+    }
+
     fn add_log(&mut self, text: &str) {
         let time_str = Local::now().format("%H:%M:%S").to_string();
         self.logs.push(format!("[{}] {}", time_str, text));
@@ -1123,6 +1160,66 @@ impl eframe::App for GameFarmerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        // Обработка закрытия окна (сворачивание в трей при клике на крестик)
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.minimize_to_tray && !self.is_quitting {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+
+        // Опрос событий системного трея
+        if let Some(tray) = &self.tray_manager {
+            let tooltip = if self.is_running {
+                if let Some(first_rp) = self.running_processes.first() {
+                    format!("Discord Farmer: {} (активно: {})", first_rp.game.name, self.running_processes.len())
+                } else {
+                    "Discord Game Farmer (Активен)".to_string()
+                }
+            } else {
+                "Discord Game Activity Manager (Остановлен)".to_string()
+            };
+            tray.set_tooltip(&tooltip);
+
+            if let Some(action) = tray.update() {
+                match action {
+                    tray::TrayAction::Show => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    tray::TrayAction::Hide => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                    tray::TrayAction::NextGame => {
+                        if self.app_mode == AppMode::RandomBatch {
+                            self.launch_random_batch();
+                        } else {
+                            let candidates: Vec<&DbGame> = self.all_games.iter()
+                                .filter(|g| !self.farmed_history_names.contains(&g.name))
+                                .collect();
+                            let chosen = if !candidates.is_empty() {
+                                let mut rng = rand::thread_rng();
+                                candidates[rand::Rng::gen_range(&mut rng, 0..candidates.len())]
+                            } else if !self.all_games.is_empty() {
+                                let mut rng = rand::thread_rng();
+                                &self.all_games[rand::Rng::gen_range(&mut rng, 0..self.all_games.len())]
+                            } else {
+                                return;
+                            };
+                            self.launch_single_game(chosen.name.clone(), chosen.exe.clone(), chosen.id.clone());
+                        }
+                    }
+                    tray::TrayAction::StopGames => {
+                        self.stop_farming();
+                    }
+                    tray::TrayAction::Quit => {
+                        self.is_quitting = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+
         // Прием логов из фонового Heartbeat API воркера квестов
         while let Ok(msg) = self.quest_log_receiver.try_recv() {
             self.active_quest_status = Some(msg.clone());
@@ -1358,15 +1455,15 @@ impl eframe::App for GameFarmerApp {
                     };
 
                     let tabs = [
-                        (AppMode::SingleGame, "🎮", strip_num(t.tab_search)),
-                        (AppMode::RandomBatch, "🚀", strip_num(t.tab_random)),
-                        (AppMode::Settings, "⚙", strip_num(t.tab_settings)),
+                        (AppMode::SingleGame, strip_num(t.tab_search)),
+                        (AppMode::RandomBatch, strip_num(t.tab_random)),
+                        (AppMode::Settings, strip_num(t.tab_settings)),
                     ];
 
                     let avail_w = ui.available_width();
                     let tab_w = ((avail_w - 8.0) / 3.0).clamp(90.0, 240.0);
 
-                    for (mode, icon, label) in tabs {
+                    for (mode, label) in tabs {
                         let is_active = self.app_mode == mode;
                         let text_color = if is_active {
                             Color32::WHITE
@@ -1374,9 +1471,8 @@ impl eframe::App for GameFarmerApp {
                             Color32::from_rgb(150, 155, 165)
                         };
 
-                        let full_title = format!("{} {}", icon, label);
                         let btn = egui::Button::new(
-                            RichText::new(&full_title)
+                            RichText::new(label)
                                 .size(12.0)
                                 .strong()
                                 .color(text_color),
@@ -1457,8 +1553,8 @@ impl eframe::App for GameFarmerApp {
                                         ui.add(info_label);
                                     } else {
                                         let title_label = egui::Label::new(
-                                            RichText::new(format!("[АКТИВНО: {} ИГР ПАРАЛЛЕЛЬНО В DISCORD]", self.running_processes.len()))
-                                                .size(12.5)
+                                            RichText::new(format!("Активно в Discord: {} игр", self.running_processes.len()))
+                                                .size(12.0)
                                                 .strong()
                                                 .color(Color32::from_rgb(70, 215, 115)),
                                         ).truncate();
@@ -1653,12 +1749,12 @@ impl eframe::App for GameFarmerApp {
 
                     ui.horizontal(|ui| {
                         let search_box = egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("🔍  Поиск по 10,400+ играм...")
+                            .hint_text(t.search_placeholder)
                             .desired_width(search_w);
                         ui.add(search_box);
 
                         let clear_btn = egui::Button::new(
-                            RichText::new("Сбросить")
+                            RichText::new(t.btn_clear)
                                 .size(11.0)
                                 .color(Color32::from_rgb(180, 185, 195)),
                         )
@@ -1672,9 +1768,9 @@ impl eframe::App for GameFarmerApp {
 
                         let fav_count = self.favorite_games.len();
                         let fav_title = if is_narrow {
-                            format!("★ Избранные ({})", fav_count)
+                            format!("★ ({})", fav_count)
                         } else {
-                            format!("★ Только избранные ({})", fav_count)
+                            format!("★ Избранное ({})", fav_count)
                         };
 
                         let fav_filter_btn = egui::Button::new(
@@ -1937,9 +2033,9 @@ impl eframe::App for GameFarmerApp {
 
                                 // 1. Пул игр для ротации
                                 let sec1_title = match self.language {
-                                    Language::Ru => "1. Пул игр для ротации:",
-                                    Language::Uk => "1. Пул ігор для ротації:",
-                                    Language::En => "1. Rotation game pool:",
+                                    Language::Ru => "Пул игр:",
+                                    Language::Uk => "Пул ігор:",
+                                    Language::En => "Game pool:",
                                 };
                                 ui.label(
                                     RichText::new(sec1_title)
@@ -1993,9 +2089,9 @@ impl eframe::App for GameFarmerApp {
 
                                 // 2. Время ротации пачки игр
                                 let sec2_title = match self.language {
-                                    Language::Ru => "2. Время ротации пачки игр:",
-                                    Language::Uk => "2. Час ротації пачки ігор:",
-                                    Language::En => "2. Batch rotation time:",
+                                    Language::Ru => "Интервал ротации:",
+                                    Language::Uk => "Інтервал ротації:",
+                                    Language::En => "Rotation interval:",
                                 };
                                 ui.label(
                                     RichText::new(sec2_title)
@@ -2008,7 +2104,7 @@ impl eframe::App for GameFarmerApp {
                                     let time_presets = [
                                         ("5 мин", 5),
                                         ("10 мин", 10),
-                                        ("15 мин (рекомендовано)", 15),
+                                        ("15 мин", 15),
                                         ("20 мин", 20),
                                     ];
                                     for (lbl, val) in time_presets {
@@ -2034,9 +2130,9 @@ impl eframe::App for GameFarmerApp {
                                 if self.interval_minutes < 6 {
                                     ui.add_space(4.0);
                                     let warn_msg = match self.language {
-                                        Language::Ru => "⚠ Discord шлёт heartbeat раз в 5 мин — для значка ставьте ≥ 6 мин (лучше 10–15 мин).",
-                                        Language::Uk => "⚠ Discord шле heartbeat раз на 5 хв — для значка ставте ≥ 6 хв (краще 10–15 хв).",
-                                        Language::En => "⚠ Discord sends heartbeats every 5 min — use ≥ 6 min (10–15 min recommended) for badge tracking.",
+                                        Language::Ru => "Интервал Discord heartbeat — 5 мин. Рекомендуется от 10 до 15 мин.",
+                                        Language::Uk => "Інтервал Discord heartbeat — 5 хв. Рекомендується від 10 до 15 хв.",
+                                        Language::En => "Discord heartbeat interval is 5 min. Recommended: 10 to 15 min.",
                                     };
                                     ui.label(
                                         RichText::new(warn_msg)
@@ -2051,9 +2147,9 @@ impl eframe::App for GameFarmerApp {
 
                                 // 3. Одновременный запуск (размер пачки)
                                 let sec3_title = match self.language {
-                                    Language::Ru => "3. Одновременный запуск (размер пачки):",
-                                    Language::Uk => "3. Одночасний запуск (розмір пачки):",
-                                    Language::En => "3. Run simultaneously (batch size):",
+                                    Language::Ru => "Количество игр:",
+                                    Language::Uk => "Кількість ігор:",
+                                    Language::En => "Simultaneous games:",
                                 };
                                 ui.label(
                                     RichText::new(sec3_title)
@@ -2066,9 +2162,9 @@ impl eframe::App for GameFarmerApp {
                                     let batch_presets = [
                                         ("4 игры", 4),
                                         ("6 игр", 6),
-                                        ("8 игр (рекомендовано)", 8),
+                                        ("8 игр", 8),
                                         ("12 игр", 12),
-                                        ("16 игр (макс)", 16),
+                                        ("16 игр", 16),
                                     ];
                                     for (lbl, val) in batch_presets {
                                         let is_sel = self.batch_size == val;
@@ -2096,9 +2192,9 @@ impl eframe::App for GameFarmerApp {
 
                                 // 4. Управление и статус прокачки
                                 let sec4_title = match self.language {
-                                    Language::Ru => "4. Управление и статус прокачки:",
-                                    Language::Uk => "4. Керування та статус прокачки:",
-                                    Language::En => "4. Farming controls & status:",
+                                    Language::Ru => "Управление:",
+                                    Language::Uk => "Керування:",
+                                    Language::En => "Controls:",
                                 };
                                 ui.label(
                                     RichText::new(sec4_title)
@@ -2420,14 +2516,21 @@ impl eframe::App for GameFarmerApp {
                                 .size(11.5)
                                 .color(Color32::from_rgb(210, 210, 210)),
                         );
+                        ui.add_space(4.0);
+                        ui.checkbox(
+                            &mut self.minimize_to_tray,
+                            RichText::new(t.minimize_to_tray)
+                                .size(11.5)
+                                .color(Color32::from_rgb(210, 210, 210)),
+                        );
 
                         ui.add_space(16.0);
                         ui.separator();
                         ui.add_space(10.0);
 
-                        // 3.5. Анти-пауза видео Discord (Промо-ролики для Орбсов)
+                        // Анти-пауза видео Discord
                         ui.label(
-                            RichText::new("Анти-пауза видео Discord (Орбсы без остановки)")
+                            RichText::new("Анти-пауза видео Discord:")
                                 .size(12.0)
                                 .strong()
                                 .color(Color32::from_rgb(200, 200, 200)),
@@ -2437,7 +2540,7 @@ impl eframe::App for GameFarmerApp {
                             let (btn_text, btn_fill, btn_stroke) = if self.anti_pause_active {
                                 ("Отключить анти-паузу видео", Color32::from_rgb(180, 50, 50), Color32::from_rgb(220, 70, 70))
                             } else {
-                                ("Включить анти-паузу видео Discord", Color32::from_rgb(35, 165, 90), Color32::from_rgb(50, 200, 110))
+                                ("Включить анти-паузу видео", Color32::from_rgb(35, 165, 90), Color32::from_rgb(50, 200, 110))
                             };
 
                             let ap_btn = egui::Button::new(
@@ -2465,7 +2568,7 @@ impl eframe::App for GameFarmerApp {
                                     match anti_pause::install_anti_pause() {
                                         Ok(_) => {
                                             self.anti_pause_active = true;
-                                            self.add_log("✅ Анти-пауза видео включена! Перезапустите Discord для активации.");
+                                            self.add_log("Анти-пауза видео включена. Перезапустите Discord.");
                                         }
                                         Err(e) => {
                                             self.add_log(&format!("Ошибка включения анти-паузы: {}", e));
@@ -2474,16 +2577,40 @@ impl eframe::App for GameFarmerApp {
                                 }
                             }
 
+                            let restart_btn = egui::Button::new(
+                                RichText::new("Перезапустить Discord")
+                                    .size(11.5)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(88, 101, 242))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(115, 128, 250)))
+                            .rounding(Rounding::same(4.0));
+
+                            if ui.add_sized(Vec2::new(170.0, 28.0), restart_btn)
+                                .on_hover_text("Перезапустить процессы Discord для применения настроек")
+                                .clicked()
+                            {
+                                match anti_pause::restart_discord() {
+                                    Ok(_) => {
+                                        self.add_log("Discord перезапущен.");
+                                    }
+                                    Err(e) => {
+                                        self.add_log(&format!("Ошибка перезапуска Discord: {}", e));
+                                    }
+                                }
+                            }
+
                             if self.anti_pause_active {
                                 ui.label(
-                                    RichText::new("● АКТИВНО (видео не останавливается)")
+                                    RichText::new("Активно")
                                         .size(11.0)
                                         .strong()
                                         .color(Color32::from_rgb(50, 225, 110)),
                                 );
                             } else {
                                 ui.label(
-                                    RichText::new("● Не активно")
+                                    RichText::new("Отключено")
                                         .size(11.0)
                                         .color(Color32::from_rgb(140, 145, 155)),
                                 );
@@ -2492,13 +2619,13 @@ impl eframe::App for GameFarmerApp {
 
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new("Позволяет свернуть Discord или переключиться на другие программы: промо-видео и ролики для Орбсов продолжают идти в фоне без остановки.")
+                            RichText::new("Воспроизведение видео не останавливается при сворачивании Discord.")
                                 .size(10.5)
                                 .color(Color32::from_rgb(150, 165, 180)),
                         );
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new("⚠️ После включения или отключения обязательно полностью перезапустите Discord (через трей или диспетчер задач).")
+                            RichText::new("Для применения настройки перезапустите Discord.")
                                 .size(10.5)
                                 .color(Color32::from_rgb(225, 180, 80)),
                         );
@@ -2598,6 +2725,7 @@ impl eframe::App for GameFarmerApp {
             interval_minutes: self.interval_minutes,
             batch_size: self.batch_size,
             exclude_running_pc_games: self.exclude_running_pc_games,
+            minimize_to_tray: self.minimize_to_tray,
             farmed_history: self.farmed_history_names.iter().cloned().collect(),
             favorite_games: self.favorite_games.iter().cloned().collect(),
             random_only_favorites: self.random_only_favorites,
@@ -2614,8 +2742,6 @@ impl eframe::App for GameFarmerApp {
         self.saved_settings.save();
     }
 }
-
-const ICON_RGBA: &[u8] = include_bytes!("../app_icon_64.rgba");
 
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -2671,6 +2797,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             setup_custom_fonts(&cc.egui_ctx);
             let mut app = GameFarmerApp::default();
+            app.init_tray(cc.egui_ctx.clone());
             if autostart {
                 app.launch_random_batch();
             }
