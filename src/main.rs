@@ -526,7 +526,27 @@ fn game_matches_query(name: &str, exe: &str, raw_query: &str) -> bool {
     if (q == "никке" || q.starts_with("никк")) && (name_lower.contains("nikke") || exe_lower.contains("nikke")) { return true; }
     if (q == "блю архив" || q == "блу архив" || q == "ba") && name_lower.contains("blue archive") { return true; }
     if (q == "варзон" || q == "варзона") && (name_lower.contains("warzone") || name_lower.contains("modern warfare")) { return true; }
-    if (q == "гта" || q == "гта 5" || q == "gta") && (name_lower.contains("grand theft auto") || exe_lower.contains("gta")) { return true; }
+    if q.starts_with("гта") || q.starts_with("gta") {
+        if name_lower.contains("grand theft auto") || exe_lower.contains("gta") {
+            let digits: String = q.chars().filter(|c| c.is_numeric()).collect();
+            if digits == "6" || q.ends_with("vi") {
+                return name_lower.contains(" vi") || name_lower.ends_with("vi") || exe_lower.contains("gta6");
+            }
+            if digits == "5" || q.ends_with(" v") {
+                return name_lower.contains(" v") || exe_lower.contains("gta5") || name_lower.contains("online");
+            }
+            if digits == "4" || q.ends_with("iv") {
+                return name_lower.contains(" iv") || exe_lower.contains("gta4") || exe_lower.contains("gtaiv");
+            }
+            if digits == "3" || q.ends_with("iii") {
+                return name_lower.contains(" iii") || exe_lower.contains("gta3");
+            }
+            if !digits.is_empty() {
+                return name_lower.contains(&digits) || exe_lower.contains(&digits);
+            }
+            return true;
+        }
+    }
     if (q == "кс" || q == "ксочка" || q == "контра" || q == "кс2") && (name_lower.contains("counter-strike") || exe_lower.contains("cs")) { return true; }
     if (q == "дота" || q == "дотка") && name_lower.contains("dota") { return true; }
     if (q == "ведьмак") && name_lower.contains("witcher") { return true; }
@@ -1153,6 +1173,21 @@ mod tests {
         assert!(GameFarmerApp::is_detectable_win_exe("bin/x64/cyberpunk2077.exe"));
         assert!(!GameFarmerApp::is_detectable_win_exe(""));
         assert!(!GameFarmerApp::is_detectable_win_exe("game.app/Contents/MacOS/game"));
+        assert!(GameFarmerApp::is_detectable_win_exe("gta6.exe"));
+    }
+
+    #[test]
+    fn gta_queries_matching() {
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "гта 6"));
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "гта6"));
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "gta 6"));
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "gta6"));
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "gta vi"));
+        assert!(!game_matches_query("Grand Theft Auto V Legacy", "gta5.exe", "гта 6"));
+        assert!(!game_matches_query("Grand Theft Auto V Legacy", "gta5.exe", "gta 6"));
+        assert!(game_matches_query("Grand Theft Auto V Legacy", "gta5.exe", "гта 5"));
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "гта"));
+        assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "gta"));
     }
 }
 
