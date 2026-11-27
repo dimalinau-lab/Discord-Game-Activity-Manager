@@ -104,7 +104,7 @@ impl GameFarmerApp {
 
                         if draw_window_control_btn(ui, WindowCaptionIcon::Close).clicked() {
                             if self.minimize_to_tray && !self.is_quitting {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                                self.hide_to_tray(ctx);
                             } else {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }

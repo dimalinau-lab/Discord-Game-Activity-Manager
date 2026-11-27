@@ -1,8 +1,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 enum IpcCommand {
@@ -13,10 +13,12 @@ enum IpcCommand {
         pid: Option<u32>,
     },
     Clear,
+    ClearAndAck(SyncSender<()>),
 }
 
 /// Асинхронный клиент Discord Rich Presence: все операции named pipe выполняются в фоновом потоке,
 /// чтобы клики по интерфейсу не вызывали подвисаний UI.
+#[derive(Clone)]
 pub struct DiscordIpc {
     tx: Sender<IpcCommand>,
 }
@@ -35,8 +37,12 @@ impl DiscordIpc {
                 current_app_id: None,
             };
             while let Ok(mut cmd) = rx.recv() {
-                // Схлопываем очередь до последней актуальной команды
+                // Схлопываем очередь до последней актуальной команды, но сохраняем ClearAndAck
                 while let Ok(next) = rx.try_recv() {
+                    if let IpcCommand::ClearAndAck(ack) = cmd {
+                        worker.clear_activity();
+                        let _ = ack.send(());
+                    }
                     cmd = next;
                 }
                 match cmd {
@@ -47,6 +53,10 @@ impl DiscordIpc {
                         pid,
                     } => worker.set_activity(&app_id, &details, &state, pid),
                     IpcCommand::Clear => worker.clear_activity(),
+                    IpcCommand::ClearAndAck(ack) => {
+                        worker.clear_activity();
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
@@ -67,6 +77,13 @@ impl DiscordIpc {
 
     pub fn clear_activity(&mut self) {
         let _ = self.tx.send(IpcCommand::Clear);
+    }
+
+    pub fn clear_activity_and_wait(&self, timeout: Duration) {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if self.tx.send(IpcCommand::ClearAndAck(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(timeout);
+        }
     }
 }
 

@@ -193,9 +193,50 @@ impl AppSettings {
 }
 
 #[cfg(windows)]
+pub(crate) fn is_window_visible_and_unminimized(main_hwnd: isize) -> bool {
+    if main_hwnd == 0 {
+        return false;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+    unsafe { IsWindowVisible(main_hwnd) != 0 && IsIconic(main_hwnd) == 0 }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_window_visible_and_unminimized(_main_hwnd: isize) -> bool {
+    true
+}
+
+#[cfg(windows)]
+pub(crate) fn wake_and_show_window(main_hwnd: isize, ctx: &eframe::egui::Context) {
+    if main_hwnd != 0 {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsIconic, SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
+        };
+        unsafe {
+            let cmd = if IsIconic(main_hwnd) != 0 {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
+            ShowWindowAsync(main_hwnd, cmd);
+            SetForegroundWindow(main_hwnd);
+        }
+    }
+    ctx.request_repaint();
+}
+
+#[cfg(not(windows))]
+pub(crate) fn wake_and_show_window(_main_hwnd: isize, ctx: &eframe::egui::Context) {
+    ctx.request_repaint();
+}
+
+#[cfg(windows)]
 struct SingleInstanceGuard {
     mutex_handle: windows_sys::Win32::Foundation::HANDLE,
     show_event: windows_sys::Win32::Foundation::HANDLE,
+    show_requested: Arc<AtomicBool>,
+    stop_watcher: Arc<AtomicBool>,
+    watcher_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(windows)]
@@ -225,11 +266,41 @@ impl SingleInstanceGuard {
             Some(Self {
                 mutex_handle: mutex,
                 show_event,
+                show_requested: Arc::new(AtomicBool::new(false)),
+                stop_watcher: Arc::new(AtomicBool::new(false)),
+                watcher_thread: None,
             })
         }
     }
 
+    fn start_watcher(&mut self, main_hwnd: isize, ctx: egui::Context) {
+        if self.show_event == 0 || self.watcher_thread.is_some() {
+            return;
+        }
+        let event_handle = self.show_event;
+        let show_req = Arc::clone(&self.show_requested);
+        let stop = Arc::clone(&self.stop_watcher);
+        self.watcher_thread = std::thread::Builder::new()
+            .name("single-instance-watcher".to_string())
+            .spawn(move || {
+                use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+                use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+                loop {
+                    let wait = unsafe { WaitForSingleObject(event_handle, INFINITE) };
+                    if stop.load(Ordering::Acquire) || wait != WAIT_OBJECT_0 {
+                        break;
+                    }
+                    show_req.store(true, Ordering::Release);
+                    wake_and_show_window(main_hwnd, &ctx);
+                }
+            })
+            .ok();
+    }
+
     fn poll_show_requested(&self) -> bool {
+        if self.show_requested.swap(false, Ordering::AcqRel) {
+            return true;
+        }
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -244,6 +315,16 @@ impl SingleInstanceGuard {
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::SetEvent;
+        self.stop_watcher.store(true, Ordering::Release);
+        unsafe {
+            if self.show_event != 0 {
+                SetEvent(self.show_event);
+            }
+        }
+        if let Some(handle) = self.watcher_thread.take() {
+            let _ = handle.join();
+        }
         unsafe {
             if self.show_event != 0 {
                 CloseHandle(self.show_event);
@@ -263,6 +344,7 @@ impl SingleInstanceGuard {
     fn acquire_or_signal_existing() -> Option<Self> {
         Some(Self)
     }
+    fn start_watcher(&mut self, _main_hwnd: isize, _ctx: egui::Context) {}
     fn poll_show_requested(&self) -> bool {
         false
     }
@@ -405,6 +487,8 @@ struct GameFarmerApp {
     // Системный трей и single-instance guard
     minimize_to_tray: bool,
     is_quitting: bool,
+    is_hidden_to_tray: bool,
+    main_hwnd: isize,
     tray_manager: Option<tray::TrayManager>,
     single_instance: Option<SingleInstanceGuard>,
 }
@@ -470,6 +554,8 @@ impl Default for GameFarmerApp {
             logs,
             minimize_to_tray: loaded_settings.minimize_to_tray,
             is_quitting: false,
+            is_hidden_to_tray: false,
+            main_hwnd: 0,
             tray_manager: None,
             single_instance: None,
             discord_ipc: DiscordIpc::new(),
@@ -773,8 +859,14 @@ fn clean_game_name(raw_name: &str, exe: &str) -> String {
 }
 
 impl GameFarmerApp {
-    pub fn init_tray(&mut self, ctx: egui::Context) {
-        match tray::TrayManager::new(ICON_RGBA, 64, 64, ctx) {
+    pub fn init_tray(&mut self, ctx: egui::Context, main_hwnd: isize) {
+        self.main_hwnd = main_hwnd;
+        let ipc_for_quit = self.discord_ipc.clone();
+        let on_hidden_quit = Arc::new(move || {
+            ipc_for_quit.clear_activity_and_wait(Duration::from_millis(300));
+            std::process::exit(0);
+        });
+        match tray::TrayManager::new(ICON_RGBA, 64, 64, ctx, main_hwnd, on_hidden_quit) {
             Ok(tm) => {
                 self.tray_manager = Some(tm);
             }
@@ -782,6 +874,18 @@ impl GameFarmerApp {
                 self.add_log(&format!("⚠️ Системный трей: {}", e));
             }
         }
+    }
+
+    pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.is_hidden_to_tray = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    pub(crate) fn show_from_tray(&mut self, ctx: &egui::Context) {
+        self.is_hidden_to_tray = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     /// Передаёт процессу-заглушке путь к PNG иконке игры (и запасную палитру) для окна в панели задач.
@@ -1347,13 +1451,11 @@ mod tests {
 
 impl eframe::App for GameFarmerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(200));
-
         // Обработка закрытия окна (сворачивание в трей при клике на крестик)
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.minimize_to_tray && !self.is_quitting {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hide_to_tray(ctx);
             }
         }
 
@@ -1373,11 +1475,10 @@ impl eframe::App for GameFarmerApp {
             if let Some(action) = tray.update() {
                 match action {
                     tray::TrayAction::Show => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.show_from_tray(ctx);
                     }
                     tray::TrayAction::Hide => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        self.hide_to_tray(ctx);
                     }
                     tray::TrayAction::NextGame => {
                         if self.app_mode == AppMode::RandomBatch {
@@ -1404,10 +1505,9 @@ impl eframe::App for GameFarmerApp {
                     tray::TrayAction::Quit => {
                         self.is_quitting = true;
                         self.stop_all_active_games();
-                        self.discord_ipc.clear_activity();
+                        self.discord_ipc.clear_activity_and_wait(Duration::from_millis(300));
                         self.saved_settings.save();
                         self.tray_manager = None;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         return;
                     }
@@ -1416,12 +1516,12 @@ impl eframe::App for GameFarmerApp {
         }
 
         // Повторный запуск exe выводит уже открытый экземпляр вместо дубля в трее
-        if let Some(ref guard) = self.single_instance {
-            if guard.poll_show_requested() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
+        let show_from_second_instance = self
+            .single_instance
+            .as_ref()
+            .is_some_and(|guard| guard.poll_show_requested());
+        if show_from_second_instance {
+            self.show_from_tray(ctx);
         }
 
         // Прием логов из фонового Heartbeat API воркера квестов
@@ -1481,6 +1581,12 @@ impl eframe::App for GameFarmerApp {
         if current_settings != self.saved_settings {
             current_settings.save();
             self.saved_settings = current_settings;
+        }
+
+        // Не запрашиваем периодическую перерисовку, когда окно скрыто в трей:
+        // на Windows скрытый HWND не получает WM_PAINT, и таймер зациклит winit в ControlFlow::Poll.
+        if !self.is_hidden_to_tray {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -1561,15 +1667,33 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    let mut instance_guard = Some(instance_guard);
     eframe::run_native(
         "Discord Game Activity Manager",
         options,
         Box::new(move |cc| {
             setup_custom_fonts(&cc.egui_ctx);
             theme::apply_artcraft_visuals(&cc.egui_ctx);
+            #[cfg(windows)]
+            let main_hwnd = {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                cc.window_handle()
+                    .ok()
+                    .and_then(|h| match h.as_raw() {
+                        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+            };
+            #[cfg(not(windows))]
+            let main_hwnd = 0isize;
+
             let mut app = GameFarmerApp::default();
-            app.single_instance = Some(instance_guard);
-            app.init_tray(cc.egui_ctx.clone());
+            if let Some(mut guard) = instance_guard.take() {
+                guard.start_watcher(main_hwnd, cc.egui_ctx.clone());
+                app.single_instance = Some(guard);
+            }
+            app.init_tray(cc.egui_ctx.clone(), main_hwnd);
             if autostart {
                 app.launch_random_batch();
             }
