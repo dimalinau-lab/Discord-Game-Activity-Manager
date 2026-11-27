@@ -496,6 +496,7 @@ struct GameFarmerApp {
 impl Default for GameFarmerApp {
     fn default() -> Self {
         AutoUpdater::cleanup_previous_update();
+        let _ = Self::find_dummy_executable();
         let mut updater = AutoUpdater::new();
         updater.check_github_update();
 

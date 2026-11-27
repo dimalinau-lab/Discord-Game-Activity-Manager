@@ -185,13 +185,31 @@ impl AutoUpdater {
         }
     }
 
-    /// Очистка временных файлов (.exe.old / .exe.new), если остались после прошлого обновления
+    /// Очистка временных файлов (.exe.old / .exe.new) и старых инсталляторов из TEMP
     pub fn cleanup_previous_update() {
         if let Ok(current_exe) = std::env::current_exe() {
-            for ext in ["exe.old", "exe.new"] {
-                let candidate = current_exe.with_extension(ext);
-                if candidate.exists() {
-                    let _ = std::fs::remove_file(candidate);
+            if let Some(parent) = current_exe.parent() {
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    let stem = current_exe
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("discord-game-farmer")
+                        .to_ascii_lowercase();
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                        if name.starts_with(&stem) && (name.ends_with(".old") || name.ends_with(".new")) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.starts_with("discordgamefarmer_setup_v") && name.ends_with(".exe") {
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
@@ -489,24 +507,19 @@ impl AutoUpdater {
             UpdateMode::DirectSelfReplace => {
                 let current_exe = std::env::current_exe()
                     .map_err(|e| format!("Не удалось определить текущий exe: {}", e))?;
-                let old_exe = current_exe.with_extension("exe.old");
-                if old_exe.exists() {
-                    let _ = std::fs::remove_file(&old_exe);
-                }
+                swap_executable_files(&current_exe, downloaded_path, pid)?;
 
-                std::fs::rename(&current_exe, &old_exe)
-                    .map_err(|e| format!("Не удалось переименовать текущий exe: {}", e))?;
-
-                if let Err(e) = std::fs::rename(downloaded_path, &current_exe) {
-                    let _ = std::fs::rename(&old_exe, &current_exe);
-                    return Err(format!("Не удалось заменить exe на новую версию: {}", e));
-                }
+                let workdir = current_exe
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| ".".to_string());
 
                 let script = format!(
                     "Wait-Process -Id {pid} -Timeout 15 -ErrorAction SilentlyContinue; \
-                     Start-Process -FilePath {target}",
+                     Start-Process -FilePath {target} -WorkingDirectory {workdir}",
                     pid = pid,
                     target = ps_single_quote(&current_exe.to_string_lossy()),
+                    workdir = ps_single_quote(&workdir),
                 );
                 Self::spawn_hidden_powershell(&script)?;
                 Ok(())
@@ -522,17 +535,38 @@ impl AutoUpdater {
                 let script = format!(
                     "Wait-Process -Id {pid} -Timeout 15 -ErrorAction SilentlyContinue; \
                      Start-Process -FilePath {setup} -ArgumentList '/SILENT','/CLOSEAPPLICATIONS',{dir_arg} -Wait; \
-                     if (Test-Path {target}) {{ Start-Process -FilePath {target} }}",
+                     if (Test-Path {target}) {{ Start-Process -FilePath {target} -WorkingDirectory {workdir} }}",
                     pid = pid,
                     setup = ps_single_quote(&downloaded_path.to_string_lossy()),
                     dir_arg = ps_single_quote(&dir_arg),
                     target = ps_single_quote(&current_exe.to_string_lossy()),
+                    workdir = ps_single_quote(&install_dir.to_string_lossy()),
                 );
                 Self::spawn_hidden_powershell(&script)?;
                 Ok(())
             }
         }
     }
+}
+
+/// Атомарно заменяет `current_exe` на `new_exe` в той же папке с откатом при ошибке.
+pub fn swap_executable_files(current_exe: &Path, new_exe: &Path, pid: u32) -> Result<PathBuf, String> {
+    let default_old = current_exe.with_extension("exe.old");
+    let backup_path = if default_old.exists() && std::fs::remove_file(&default_old).is_err() {
+        current_exe.with_extension(format!("exe.{}.old", pid))
+    } else {
+        default_old
+    };
+
+    std::fs::rename(current_exe, &backup_path)
+        .map_err(|e| format!("Не удалось переименовать текущий exe: {}", e))?;
+
+    if let Err(e) = std::fs::rename(new_exe, current_exe) {
+        let _ = std::fs::rename(&backup_path, current_exe);
+        return Err(format!("Не удалось заменить exe на новую версию: {}", e));
+    }
+
+    Ok(backup_path)
 }
 
 #[cfg(test)]
@@ -582,5 +616,24 @@ mod tests {
     fn writable_temp_dir_uses_direct_self_replace() {
         let temp_exe = std::env::temp_dir().join("discord-game-farmer.exe");
         assert_eq!(detect_update_mode(&temp_exe), UpdateMode::DirectSelfReplace);
+    }
+
+    #[test]
+    fn swap_executable_files_replaces_target_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("dgf_swap_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let target = dir.join("discord-game-farmer.exe");
+        let new_file = dir.join("discord-game-farmer.exe.new");
+        std::fs::write(&target, b"MZ_OLD_VERSION").unwrap();
+        std::fs::write(&new_file, b"MZ_NEW_VERSION").unwrap();
+
+        let backup = swap_executable_files(&target, &new_file, 1234).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"MZ_NEW_VERSION");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"MZ_OLD_VERSION");
+        assert!(!new_file.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
