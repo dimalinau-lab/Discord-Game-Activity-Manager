@@ -913,6 +913,10 @@ impl GameFarmerApp {
             if let Some(parent) = curr_exe.parent() {
                 let candidate = parent.join("dummy_game.exe");
                 if candidate.exists() {
+                    // Синхронизируем локальный dummy_game.exe с вшитым при обновлении portable-версии
+                    if std::fs::read(&candidate).ok().as_deref() != Some(EMBEDDED_DUMMY_GAME) {
+                        let _ = std::fs::write(&candidate, EMBEDDED_DUMMY_GAME);
+                    }
                     return Some(candidate);
                 }
                 // Автоматическое самоизвлечение встроенного dummy_game.exe
