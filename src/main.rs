@@ -1535,8 +1535,18 @@ impl eframe::App for GameFarmerApp {
         }
 
         // Опрос статуса автообновления
-        if let Some(log_msg) = self.updater.poll() {
+        let update_outcome = self.updater.poll();
+        if let Some(log_msg) = update_outcome.log {
             self.add_log(&log_msg);
+        }
+        if update_outcome.restart_ready {
+            self.is_quitting = true;
+            self.stop_all_active_games();
+            self.discord_ipc.clear_activity_and_wait(Duration::from_millis(300));
+            self.saved_settings.save();
+            self.tray_manager = None;
+            self.single_instance = None;
+            std::process::exit(0);
         }
 
         // Таймер активности

@@ -11,8 +11,8 @@ const USER_AGENT: &str = "DiscordGameActivityManager";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateMode {
+    DirectSelfReplace,
     Installer,
-    PortableExe,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -62,6 +62,11 @@ pub enum UpdaterMessage {
     DownloadError(String),
 }
 
+pub struct PollOutcome {
+    pub log: Option<String>,
+    pub restart_ready: bool,
+}
+
 pub struct AutoUpdater {
     pub current_version: String,
     pub status: UpdateStatus,
@@ -95,37 +100,48 @@ pub fn is_newer_version(candidate: &str, current: &str) -> bool {
     }
 }
 
-/// Определяет, запущена ли программа из установленной папки или как portable .exe.
-pub fn detect_update_mode(exe_path: &Path, localappdata: &str) -> UpdateMode {
-    if let Some(parent) = exe_path.parent() {
-        if parent.join("unins000.exe").exists() {
-            return UpdateMode::Installer;
+/// Проверяет, доступна ли папка с текущим .exe для записи (чтобы заменить файл ярлыка напрямую).
+pub fn is_dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".dgf_write_probe_{}", std::process::id()));
+    match File::create(&probe) {
+        Ok(f) => {
+            drop(f);
+            let _ = std::fs::remove_file(&probe);
+            true
         }
-        if !localappdata.is_empty() {
-            let default_install_dir = Path::new(localappdata).join(r"Programs\DiscordGameFarmer");
-            let parent_norm = parent.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
-            let default_norm = default_install_dir
-                .to_string_lossy()
-                .trim_end_matches(['\\', '/'])
-                .to_lowercase();
-            if parent_norm == default_norm {
-                return UpdateMode::Installer;
-            }
+        Err(_) => false,
+    }
+}
+
+/// Для любой доступной на запись папки (включая установленную) обновляем сам exe на месте,
+/// чтобы 100% заменить файл, на который указывает ярлык; Setup.exe используется только как fallback для read-only папок.
+pub fn detect_update_mode(exe_path: &Path) -> UpdateMode {
+    if let Some(parent) = exe_path.parent() {
+        if is_dir_writable(parent) {
+            return UpdateMode::DirectSelfReplace;
         }
     }
-    UpdateMode::PortableExe
+    UpdateMode::Installer
 }
 
 fn current_update_mode() -> UpdateMode {
-    let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
     std::env::current_exe()
-        .map(|p| detect_update_mode(&p, &localappdata))
+        .map(|p| detect_update_mode(&p))
         .unwrap_or(UpdateMode::Installer)
 }
 
-/// Строгий выбор ассета под режим: установщик (*_Setup.exe) или portable-бинарник (discord-game-farmer.exe).
+/// Строгий выбор ассета: прямой бинарник `discord-game-farmer.exe` или инсталлятор `*_Setup.exe`.
 pub fn select_release_asset(assets: &[GitHubAsset], mode: UpdateMode) -> Option<&GitHubAsset> {
     match mode {
+        UpdateMode::DirectSelfReplace => assets
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case("discord-game-farmer.exe"))
+            .or_else(|| {
+                assets.iter().find(|a| {
+                    let lower = a.name.to_ascii_lowercase();
+                    lower.ends_with(".exe") && !lower.contains("setup")
+                })
+            }),
         UpdateMode::Installer => assets
             .iter()
             .find(|a| a.name.eq_ignore_ascii_case("DiscordGameFarmer_Setup.exe"))
@@ -133,15 +149,6 @@ pub fn select_release_asset(assets: &[GitHubAsset], mode: UpdateMode) -> Option<
                 assets.iter().find(|a| {
                     let lower = a.name.to_ascii_lowercase();
                     lower.ends_with("_setup.exe") || lower.ends_with("setup.exe")
-                })
-            }),
-        UpdateMode::PortableExe => assets
-            .iter()
-            .find(|a| a.name.eq_ignore_ascii_case("discord-game-farmer.exe"))
-            .or_else(|| {
-                assets.iter().find(|a| {
-                    let lower = a.name.to_ascii_lowercase();
-                    lower.ends_with(".exe") && !lower.contains("setup")
                 })
             }),
     }
@@ -161,9 +168,8 @@ fn is_valid_pe_file(path: &Path) -> bool {
     f.read_exact(&mut magic).is_ok() && magic == *b"MZ"
 }
 
-fn ps_single_quote(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("'{}'", raw.replace('\'', "''"))
+fn ps_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }
 
 impl AutoUpdater {
@@ -179,16 +185,14 @@ impl AutoUpdater {
         }
     }
 
-    /// Очистка старых файлов .exe.old, если остались от предыдущих обновлений
+    /// Очистка временных файлов (.exe.old / .exe.new), если остались после прошлого обновления
     pub fn cleanup_previous_update() {
         if let Ok(current_exe) = std::env::current_exe() {
-            let old_exe = current_exe.with_extension("exe.old");
-            if old_exe.exists() {
-                let _ = std::fs::remove_file(old_exe);
-            }
-            let new_exe = current_exe.with_extension("exe.new");
-            if new_exe.exists() {
-                let _ = std::fs::remove_file(new_exe);
+            for ext in ["exe.old", "exe.new"] {
+                let candidate = current_exe.with_extension(ext);
+                if candidate.exists() {
+                    let _ = std::fs::remove_file(candidate);
+                }
             }
         }
     }
@@ -280,10 +284,7 @@ impl AutoUpdater {
         thread::spawn(move || {
             let clean_ver = version.trim_start_matches('v');
             let target_path = match mode {
-                UpdateMode::Installer => {
-                    std::env::temp_dir().join(format!("DiscordGameFarmer_Setup_v{}.exe", clean_ver))
-                }
-                UpdateMode::PortableExe => match std::env::current_exe() {
+                UpdateMode::DirectSelfReplace => match std::env::current_exe() {
                     Ok(cur) => cur.with_extension("exe.new"),
                     Err(e) => {
                         let _ = tx.send(UpdaterMessage::DownloadError(format!(
@@ -293,6 +294,9 @@ impl AutoUpdater {
                         return;
                     }
                 },
+                UpdateMode::Installer => {
+                    std::env::temp_dir().join(format!("DiscordGameFarmer_Setup_v{}.exe", clean_ver))
+                }
             };
 
             let resp = match ureq::get(&download_url)
@@ -353,7 +357,6 @@ impl AutoUpdater {
 
                 downloaded += bytes_read as u64;
 
-                // Отправляем прогресс каждые 128 КБ
                 if downloaded - last_progress_report >= 131072
                     || (total_bytes > 0 && downloaded == total_bytes)
                 {
@@ -385,8 +388,9 @@ impl AutoUpdater {
     }
 
     /// Опрос очереди сообщений от фоновых потоков (вызывается в каждом кадре UI)
-    pub fn poll(&mut self) -> Option<String> {
+    pub fn poll(&mut self) -> PollOutcome {
         let mut log_message = None;
+        let mut restart_ready = false;
 
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
@@ -438,9 +442,15 @@ impl AutoUpdater {
                     self.is_downloading = false;
                     self.status = UpdateStatus::Installing;
 
-                    if let Err(err) = Self::apply_update_and_restart(&installer_path) {
-                        self.status = UpdateStatus::Error(err.clone());
-                        log_message = Some(format!("Ошибка установки обновления: {}", err));
+                    match Self::prepare_update_and_spawn_restart(&installer_path) {
+                        Ok(()) => {
+                            restart_ready = true;
+                            log_message = Some("Обновление применено, выполняется перезапуск...".to_string());
+                        }
+                        Err(err) => {
+                            self.status = UpdateStatus::Error(err.clone());
+                            log_message = Some(format!("Ошибка установки обновления: {}", err));
+                        }
                     }
                 }
                 UpdaterMessage::DownloadError(e) => {
@@ -451,7 +461,10 @@ impl AutoUpdater {
             }
         }
 
-        log_message
+        PollOutcome {
+            log: log_message,
+            restart_ready,
+        }
     }
 
     fn spawn_hidden_powershell(script: &str) -> Result<(), String> {
@@ -468,34 +481,12 @@ impl AutoUpdater {
             .map_err(|e| format!("Не удалось запустить скрипт обновления: {}", e))
     }
 
-    fn apply_update_and_restart(downloaded_path: &Path) -> Result<(), String> {
+    fn prepare_update_and_spawn_restart(downloaded_path: &Path) -> Result<(), String> {
         let pid = std::process::id();
         let mode = current_update_mode();
 
         match mode {
-            UpdateMode::Installer => {
-                let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-                let default_installed = PathBuf::from(&localappdata)
-                    .join(r"Programs\DiscordGameFarmer\discord-game-farmer.exe");
-                let target_app = match std::env::current_exe() {
-                    Ok(cur) if detect_update_mode(&cur, &localappdata) == UpdateMode::Installer => {
-                        cur
-                    }
-                    _ => default_installed,
-                };
-
-                let script = format!(
-                    "Wait-Process -Id {pid} -Timeout 10 -ErrorAction SilentlyContinue; \
-                     Start-Process -FilePath {setup} -ArgumentList '/SILENT','/CLOSEAPPLICATIONS' -Wait; \
-                     if (Test-Path {target}) {{ Start-Process -FilePath {target} }}",
-                    pid = pid,
-                    setup = ps_single_quote(downloaded_path),
-                    target = ps_single_quote(&target_app),
-                );
-                Self::spawn_hidden_powershell(&script)?;
-                std::process::exit(0);
-            }
-            UpdateMode::PortableExe => {
+            UpdateMode::DirectSelfReplace => {
                 let current_exe = std::env::current_exe()
                     .map_err(|e| format!("Не удалось определить текущий exe: {}", e))?;
                 let old_exe = current_exe.with_extension("exe.old");
@@ -512,13 +503,33 @@ impl AutoUpdater {
                 }
 
                 let script = format!(
-                    "Wait-Process -Id {pid} -Timeout 10 -ErrorAction SilentlyContinue; \
+                    "Wait-Process -Id {pid} -Timeout 15 -ErrorAction SilentlyContinue; \
                      Start-Process -FilePath {target}",
                     pid = pid,
-                    target = ps_single_quote(&current_exe),
+                    target = ps_single_quote(&current_exe.to_string_lossy()),
                 );
                 Self::spawn_hidden_powershell(&script)?;
-                std::process::exit(0);
+                Ok(())
+            }
+            UpdateMode::Installer => {
+                let current_exe = std::env::current_exe()
+                    .map_err(|e| format!("Не удалось определить текущий exe: {}", e))?;
+                let install_dir = current_exe
+                    .parent()
+                    .ok_or_else(|| "Не удалось определить папку установки".to_string())?;
+                let dir_arg = format!("/DIR={}", install_dir.to_string_lossy());
+
+                let script = format!(
+                    "Wait-Process -Id {pid} -Timeout 15 -ErrorAction SilentlyContinue; \
+                     Start-Process -FilePath {setup} -ArgumentList '/SILENT','/CLOSEAPPLICATIONS',{dir_arg} -Wait; \
+                     if (Test-Path {target}) {{ Start-Process -FilePath {target} }}",
+                    pid = pid,
+                    setup = ps_single_quote(&downloaded_path.to_string_lossy()),
+                    dir_arg = ps_single_quote(&dir_arg),
+                    target = ps_single_quote(&current_exe.to_string_lossy()),
+                );
+                Self::spawn_hidden_powershell(&script)?;
+                Ok(())
             }
         }
     }
@@ -536,12 +547,12 @@ mod tests {
                 size: 11_000_000,
             },
             GitHubAsset {
-                name: "DiscordGameFarmer-v0.2.15-portable.zip".to_string(),
+                name: "DiscordGameFarmer-v0.2.16-portable.zip".to_string(),
                 browser_download_url: "https://example.com/portable.zip".to_string(),
                 size: 8_000_000,
             },
             GitHubAsset {
-                name: "DiscordGameFarmer-v0.2.15-x64.msi".to_string(),
+                name: "DiscordGameFarmer-v0.2.16-x64.msi".to_string(),
                 browser_download_url: "https://example.com/app.msi".to_string(),
                 size: 5_000_000,
             },
@@ -554,26 +565,22 @@ mod tests {
     }
 
     #[test]
-    fn installer_mode_selects_setup_exe_not_app_exe() {
+    fn direct_replace_selects_app_exe_not_setup_exe() {
+        let assets = sample_assets();
+        let chosen = select_release_asset(&assets, UpdateMode::DirectSelfReplace).unwrap();
+        assert_eq!(chosen.name, "discord-game-farmer.exe");
+    }
+
+    #[test]
+    fn installer_fallback_selects_setup_exe_not_app_exe() {
         let assets = sample_assets();
         let chosen = select_release_asset(&assets, UpdateMode::Installer).unwrap();
         assert_eq!(chosen.name, "DiscordGameFarmer_Setup.exe");
     }
 
     #[test]
-    fn portable_mode_selects_app_exe_not_setup_exe() {
-        let assets = sample_assets();
-        let chosen = select_release_asset(&assets, UpdateMode::PortableExe).unwrap();
-        assert_eq!(chosen.name, "discord-game-farmer.exe");
-    }
-
-    #[test]
-    fn detect_mode_recognizes_localappdata_install_and_portable() {
-        let localappdata = r"C:\Users\Test\AppData\Local";
-        let installed = Path::new(r"C:\Users\Test\AppData\Local\Programs\DiscordGameFarmer\discord-game-farmer.exe");
-        assert_eq!(detect_update_mode(installed, localappdata), UpdateMode::Installer);
-
-        let portable = Path::new(r"D:\Games\DiscordFarmer\discord-game-farmer.exe");
-        assert_eq!(detect_update_mode(portable, localappdata), UpdateMode::PortableExe);
+    fn writable_temp_dir_uses_direct_self_replace() {
+        let temp_exe = std::env::temp_dir().join("discord-game-farmer.exe");
+        assert_eq!(detect_update_mode(&temp_exe), UpdateMode::DirectSelfReplace);
     }
 }
