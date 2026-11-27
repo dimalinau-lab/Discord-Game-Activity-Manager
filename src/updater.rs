@@ -549,6 +549,180 @@ impl AutoUpdater {
     }
 }
 
+pub fn is_legacy_temp_updater_launch(exe_path: &Path, args: &[String]) -> bool {
+    let name = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let looks_like_setup_name = name.starts_with("discordgamefarmer_setup_v") && name.ends_with(".exe");
+    let has_silent_flags = args.iter().any(|a| a.eq_ignore_ascii_case("/SILENT"))
+        && args.iter().any(|a| a.eq_ignore_ascii_case("/CLOSEAPPLICATIONS"));
+    looks_like_setup_name || has_silent_flags
+}
+
+pub fn install_binary_to_dir(source_exe: &Path, target_dir: &Path, dummy_bytes: &[u8]) -> Result<(), String> {
+    if !target_dir.exists() {
+        return Err("Целевая папка не существует".to_string());
+    }
+    let target_exe = target_dir.join("discord-game-farmer.exe");
+    let staged_exe = target_dir.join("discord-game-farmer.exe.new");
+    let pid = std::process::id();
+
+    let mut last_err = String::new();
+    let mut swapped = false;
+    for _ in 0..15 {
+        if let Err(e) = std::fs::copy(source_exe, &staged_exe) {
+            last_err = format!("Ошибка копирования в {}: {}", staged_exe.display(), e);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
+        }
+        if target_exe.exists() {
+            match swap_executable_files(&target_exe, &staged_exe, pid) {
+                Ok(_) => {
+                    swapped = true;
+                    break;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&staged_exe);
+                    last_err = e;
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        } else if let Err(e) = std::fs::rename(&staged_exe, &target_exe) {
+            let _ = std::fs::remove_file(&staged_exe);
+            last_err = format!("Ошибка записи {}: {}", target_exe.display(), e);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        } else {
+            swapped = true;
+            break;
+        }
+    }
+
+    if !swapped {
+        return Err(last_err);
+    }
+
+    let target_dummy = target_dir.join("dummy_game.exe");
+    if std::fs::read(&target_dummy).ok().as_deref() != Some(dummy_bytes) {
+        let _ = std::fs::write(&target_dummy, dummy_bytes);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_hidden_command(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+}
+
+#[cfg(windows)]
+fn query_inno_install_location() -> Option<PathBuf> {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{5E99D631-4B28-4B2C-9852-7369B609E6D8}_is1";
+    let out = run_hidden_command("reg.exe", &["query", key, "/v", "InstallLocation"])?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(pos) = line.find("REG_SZ") {
+            let raw = line[pos + "REG_SZ".len()..].trim();
+            if !raw.is_empty() {
+                return Some(PathBuf::from(raw));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn update_inno_display_version(version: &str) {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{5E99D631-4B28-4B2C-9852-7369B609E6D8}_is1";
+    if run_hidden_command("reg.exe", &["query", key, "/v", "InstallLocation"])
+        .is_some_and(|o| o.status.success())
+    {
+        let _ = run_hidden_command(
+            "reg.exe",
+            &["add", key, "/v", "DisplayVersion", "/t", "REG_SZ", "/d", version, "/f"],
+        );
+    }
+}
+
+/// Если новая сборка запущена старым апдейтером как `%TEMP%\DiscordGameFarmer_Setup_v*.exe`,
+/// она сама завершает старые процессы, переносит себя в папку установки/ярлыка и выходит,
+/// чтобы `cmd /c start /wait ... & start ...` сразу запустил уже обновлённую версию.
+pub fn handle_legacy_temp_updater_bootstrap(dummy_bytes: &[u8]) -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return false;
+    };
+    let args: Vec<String> = std::env::args().collect();
+    if !is_legacy_temp_updater_launch(&current_exe, &args) {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        let pid_filter = format!("PID ne {}", std::process::id());
+        let _ = run_hidden_command(
+            "taskkill.exe",
+            &["/F", "/FI", &pid_filter, "/IM", "discord-game-farmer.exe"],
+        );
+        let _ = run_hidden_command("taskkill.exe", &["/F", "/IM", "dummy_game.exe"]);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(reg_dir) = query_inno_install_location() {
+            candidates.push(reg_dir);
+        }
+        let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        if !localappdata.is_empty() {
+            candidates.push(PathBuf::from(&localappdata).join(r"Programs\DiscordGameFarmer"));
+        }
+        candidates.push(PathBuf::from(r"D:\DiscordGameFarmer"));
+        candidates.push(PathBuf::from(r"C:\DiscordGameFarmer"));
+
+        let mut seen = std::collections::HashSet::new();
+        let mut updated_exe: Option<PathBuf> = None;
+
+        for dir in candidates {
+            let norm = dir
+                .to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_ascii_lowercase();
+            if norm.is_empty() || !seen.insert(norm) {
+                continue;
+            }
+            if dir.join("discord-game-farmer.exe").exists() {
+                if install_binary_to_dir(&current_exe, &dir, dummy_bytes).is_ok()
+                    && updated_exe.is_none()
+                {
+                    updated_exe = Some(dir.join("discord-game-farmer.exe"));
+                }
+            }
+        }
+
+        if let Some(target_exe) = updated_exe {
+            update_inno_display_version(env!("CARGO_PKG_VERSION"));
+            let has_silent = args.iter().any(|a| a.eq_ignore_ascii_case("/SILENT"));
+            if !has_silent {
+                let mut cmd = Command::new(&target_exe);
+                if let Some(parent) = target_exe.parent() {
+                    cmd.current_dir(parent);
+                }
+                let _ = cmd.spawn();
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Атомарно заменяет `current_exe` на `new_exe` в той же папке с откатом при ошибке.
 pub fn swap_executable_files(current_exe: &Path, new_exe: &Path, pid: u32) -> Result<PathBuf, String> {
     let default_old = current_exe.with_extension("exe.old");
@@ -635,5 +809,47 @@ mod tests {
         assert!(!new_file.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_temp_updater_launch_detection() {
+        let temp_setup = Path::new(r"C:\Users\Test\AppData\Local\Temp\DiscordGameFarmer_Setup_v0.2.19.exe");
+        assert!(is_legacy_temp_updater_launch(temp_setup, &[]));
+
+        let normal_exe = Path::new(r"D:\DiscordGameFarmer\discord-game-farmer.exe");
+        assert!(!is_legacy_temp_updater_launch(normal_exe, &[]));
+        assert!(is_legacy_temp_updater_launch(
+            normal_exe,
+            &[
+                "app".to_string(),
+                "/SILENT".to_string(),
+                "/CLOSEAPPLICATIONS".to_string()
+            ]
+        ));
+    }
+
+    #[test]
+    fn install_binary_to_dir_replaces_exe_and_dummy_game() {
+        let root = std::env::temp_dir().join(format!("dgf_bootstrap_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let install_dir = root.join("install");
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        let src_exe = root.join("DiscordGameFarmer_Setup_v0.2.19.exe");
+        std::fs::write(&src_exe, b"MZ_NEW_APP_19").unwrap();
+        std::fs::write(install_dir.join("discord-game-farmer.exe"), b"MZ_OLD_APP_8").unwrap();
+        std::fs::write(install_dir.join("dummy_game.exe"), b"OLD_DUMMY").unwrap();
+
+        install_binary_to_dir(&src_exe, &install_dir, b"NEW_DUMMY").unwrap();
+        assert_eq!(
+            std::fs::read(install_dir.join("discord-game-farmer.exe")).unwrap(),
+            b"MZ_NEW_APP_19"
+        );
+        assert_eq!(
+            std::fs::read(install_dir.join("dummy_game.exe")).unwrap(),
+            b"NEW_DUMMY"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

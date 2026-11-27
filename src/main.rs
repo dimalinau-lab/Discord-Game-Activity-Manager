@@ -1661,6 +1661,9 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    if updater::handle_legacy_temp_updater_bootstrap(EMBEDDED_DUMMY_GAME) {
+        return Ok(());
+    }
     let Some(instance_guard) = SingleInstanceGuard::acquire_or_signal_existing() else {
         return Ok(());
     };
