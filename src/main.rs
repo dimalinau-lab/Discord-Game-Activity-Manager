@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use chrono::Local;
-use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
+use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 // Вшитая база данных всех 25 887 игр Discord
@@ -84,6 +84,20 @@ enum AppMode {
     Settings,    // 3: Настройки
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum GameViewMode {
+    Grid,
+    List,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum GameSortMode {
+    NameAsc,
+    NameDesc,
+    FavoritesFirst,
+    DetectableExeFirst,
+}
+
 mod i18n;
 use i18n::*;
 
@@ -91,11 +105,14 @@ mod discord_ipc;
 use discord_ipc::DiscordIpc;
 
 mod updater;
-use updater::{AutoUpdater, UpdateStatus};
+use updater::AutoUpdater;
 
 mod quest_api;
 mod anti_pause;
 mod tray;
+mod theme;
+mod icon_cache;
+mod ui;
 
 const ICON_RGBA: &[u8] = include_bytes!("../app_icon_64.rgba");
 
@@ -176,6 +193,82 @@ impl AppSettings {
 }
 
 #[cfg(windows)]
+struct SingleInstanceGuard {
+    mutex_handle: windows_sys::Win32::Foundation::HANDLE,
+    show_event: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl SingleInstanceGuard {
+    fn acquire_or_signal_existing() -> Option<Self> {
+        use std::ptr::null;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, CreateMutexW, OpenEventW, SetEvent, EVENT_MODIFY_STATE,
+        };
+
+        let mutex_name: Vec<u16> = "Local\\DiscordGameFarmerSingleInstance\0".encode_utf16().collect();
+        let event_name: Vec<u16> = "Local\\DiscordGameFarmerShowEvent\0".encode_utf16().collect();
+
+        unsafe {
+            let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
+            if mutex != 0 && GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(mutex);
+                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
+                if ev != 0 {
+                    SetEvent(ev);
+                    CloseHandle(ev);
+                }
+                return None;
+            }
+            let show_event = CreateEventW(null(), 0, 0, event_name.as_ptr());
+            Some(Self {
+                mutex_handle: mutex,
+                show_event,
+            })
+        }
+    }
+
+    fn poll_show_requested(&self) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        if self.show_event == 0 {
+            return false;
+        }
+        unsafe { WaitForSingleObject(self.show_event, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            if self.show_event != 0 {
+                CloseHandle(self.show_event);
+            }
+            if self.mutex_handle != 0 {
+                CloseHandle(self.mutex_handle);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct SingleInstanceGuard;
+
+#[cfg(not(windows))]
+impl SingleInstanceGuard {
+    fn acquire_or_signal_existing() -> Option<Self> {
+        Some(Self)
+    }
+    fn poll_show_requested(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(windows)]
 struct ProcessJob {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -252,12 +345,17 @@ struct GameFarmerApp {
 
     // Режим работы
     app_mode: AppMode,
+    prev_mode: AppMode,
+    view_mode: GameViewMode,
+    sort_mode: GameSortMode,
+    show_logs_drawer: bool,
 
-    // База игр
+    // База игр и кэш иконок Discord
     all_games: Vec<DbGame>,
     search_query: String,
     last_search_query: String,
     filtered_indices: Vec<usize>,
+    icon_cache: icon_cache::IconCache,
 
     // Время работы (в минутах)
     interval_minutes: u32,
@@ -304,10 +402,11 @@ struct GameFarmerApp {
     // Автообновление
     updater: AutoUpdater,
 
-    // Системный трей
+    // Системный трей и single-instance guard
     minimize_to_tray: bool,
     is_quitting: bool,
     tray_manager: Option<tray::TrayManager>,
+    single_instance: Option<SingleInstanceGuard>,
 }
 
 impl Default for GameFarmerApp {
@@ -344,10 +443,15 @@ impl Default for GameFarmerApp {
             language: loaded_settings.language,
             ui_scale: loaded_settings.ui_scale,
             app_mode: AppMode::SingleGame,
+            prev_mode: AppMode::SingleGame,
+            view_mode: GameViewMode::Grid,
+            sort_mode: GameSortMode::NameAsc,
+            show_logs_drawer: false,
             all_games,
             search_query: String::new(),
             last_search_query: String::new(),
             filtered_indices: Vec::new(),
+            icon_cache: icon_cache::IconCache::new(),
             interval_minutes: loaded_settings.interval_minutes,
             batch_size: loaded_settings.batch_size,
             exclude_running_pc_games: loaded_settings.exclude_running_pc_games,
@@ -367,6 +471,7 @@ impl Default for GameFarmerApp {
             minimize_to_tray: loaded_settings.minimize_to_tray,
             is_quitting: false,
             tray_manager: None,
+            single_instance: None,
             discord_ipc: DiscordIpc::new(),
             discord_token: quest_api::extract_discord_token(),
             quest_stop_signal: None,
@@ -679,6 +784,17 @@ impl GameFarmerApp {
         }
     }
 
+    /// Передаёт процессу-заглушке путь к PNG иконке игры (и запасную палитру) для окна в панели задач.
+    fn configure_stub_icon_env(&mut self, cmd: &mut Command, game_name: &str, app_id: &str) {
+        if !app_id.is_empty() {
+            self.icon_cache.ensure_requested(app_id);
+            cmd.env("DGF_ICON_PNG", self.icon_cache.png_path(app_id));
+        }
+        let (bg, fg) = theme::monogram_palette(game_name);
+        cmd.env("DGF_ICON_BG", format!("{},{},{}", bg.r(), bg.g(), bg.b()));
+        cmd.env("DGF_ICON_FG", format!("{},{},{}", fg.r(), fg.g(), fg.b()));
+    }
+
     fn add_log(&mut self, text: &str) {
         let time_str = Local::now().format("%H:%M:%S").to_string();
         self.logs.push(format!("[{}] {}", time_str, text));
@@ -804,22 +920,27 @@ impl GameFarmerApp {
         (candidates, excluded_on_pc)
     }
 
-    /// Остановка ВСЕХ запущенных процессов
+    /// Остановка ВСЕХ запущенных процессов без блокировки UI-потока
     fn stop_all_active_games(&mut self) {
         self.active_quest_status = None;
         if let Some(sig) = self.quest_stop_signal.take() {
             sig.store(true, Ordering::Relaxed);
         }
-        for mut rp in self.running_processes.drain(..) {
+        let mut drained: Vec<RunningProcess> = self.running_processes.drain(..).collect();
+        for rp in &mut drained {
             let _ = rp.child.kill();
-            let _ = rp.child.wait();
+        }
+        if !drained.is_empty() {
+            std::thread::spawn(move || {
+                for mut rp in drained {
+                    let _ = rp.child.wait();
+                }
+            });
         }
     }
 
     /// Запуск одной конкретной игры на выбранное время
     fn launch_single_game(&mut self, name: String, exe: String, app_id: String) {
-        self.stop_all_active_games();
-        self.discord_ipc.clear_activity();
         self.stop_all_active_games();
         self.discord_ipc.clear_activity();
         self.app_mode = AppMode::SingleGame;
@@ -830,15 +951,13 @@ impl GameFarmerApp {
             name.clone()
         };
 
-        // 1. Предварительно устанавливаем активность Discord IPC
-        if !app_id.is_empty() {
-            self.discord_ipc.set_activity(&app_id, &clean_title, "In Game", None);
-        }
-
-        // 2. Запускаем stub-процесс (для Windows-хуков Discord и прохождения квестов)
+        // 1. Запускаем stub-процесс (для Windows-хуков Discord и прохождения квестов)
         let dummy_exe = match Self::find_dummy_executable() {
             Some(p) => p,
             None => {
+                if !app_id.is_empty() {
+                    self.discord_ipc.set_activity(&app_id, &clean_title, "In Game", None);
+                }
                 self.add_log("Внимание: dummy_game.exe не найден (активность установлена через Discord IPC)");
                 self.is_running = true;
                 self.batch_started_at = Some(Instant::now());
@@ -859,6 +978,7 @@ impl GameFarmerApp {
         if let Some(parent) = target_stub.parent() {
             cmd.current_dir(parent);
         }
+        self.configure_stub_icon_env(&mut cmd, &clean_title, &app_id);
         cmd.arg(&clean_title);
 
         match cmd.spawn() {
@@ -889,43 +1009,56 @@ impl GameFarmerApp {
                     name, self.interval_minutes, child_pid
                 ));
 
-                // 3. Автоматическая фоновая отправка Heartbeat для квестов Discord
+                // 2. Асинхронная проверка и запуск Heartbeat-воркера квеста в фоне (без задержки UI)
                 if !app_id.is_empty() {
-                    if self.discord_token.is_none() {
-                        self.discord_token = quest_api::extract_discord_token();
-                    }
-                    let token_opt = self.discord_token.clone();
-                    if let Some(token) = token_opt {
+                    let cached_token = self.discord_token.clone();
+                    let stop_sig = Arc::new(AtomicBool::new(false));
+                    self.quest_stop_signal = Some(Arc::clone(&stop_sig));
+                    let log_tx = self.quest_log_sender.clone();
+                    std::thread::spawn(move || {
+                        let Some(token) = cached_token.or_else(quest_api::extract_discord_token) else {
+                            return;
+                        };
+                        if stop_sig.load(Ordering::Relaxed) {
+                            return;
+                        }
                         if let Some(quest) = quest_api::get_enrolled_quest(&token, &app_id, &clean_title) {
+                            if stop_sig.load(Ordering::Relaxed) {
+                                return;
+                            }
                             if quest.completed {
-                                self.add_log(&format!(
+                                let _ = log_tx.send(format!(
                                     "✨ Квест Discord '{}' уже завершен на 100%! Заберите награду в Discord.",
                                     quest.quest_name
                                 ));
                             } else {
-                                self.add_log(&format!(
+                                let _ = log_tx.send(format!(
                                     "🎯 Квест Discord '{}' активен! Включена авто-отправка прогресса (Heartbeat API, текущий: {}/{} сек).",
                                     quest.quest_name, quest.current_seconds, quest.target_seconds
                                 ));
-                                let stop_sig = Arc::new(AtomicBool::new(false));
-                                quest_api::spawn_quest_heartbeat_worker(
+                                let handle = quest_api::spawn_quest_heartbeat_worker(
                                     token,
                                     quest,
-                                    Arc::clone(&stop_sig),
-                                    self.quest_log_sender.clone(),
+                                    stop_sig,
+                                    log_tx,
                                 );
-                                self.quest_stop_signal = Some(stop_sig);
+                                let _ = handle.join();
                             }
                         } else if let Some(un_quest_name) = quest_api::get_unenrolled_quest_name(&token, &app_id, &clean_title) {
-                            self.add_log(&format!(
-                                "⚠️ Внимание: Для игры '{}' есть квест в Discord ('{}'), но он еще не принят! Нажмите «Принять задание» в Discord и перезапустите таймер.",
-                                clean_title, un_quest_name
-                            ));
+                            if !stop_sig.load(Ordering::Relaxed) {
+                                let _ = log_tx.send(format!(
+                                    "⚠️ Внимание: Для игры '{}' есть квест в Discord ('{}'), но он еще не принят! Нажмите «Принять задание» в Discord и перезапустите таймер.",
+                                    clean_title, un_quest_name
+                                ));
+                            }
                         }
-                    }
+                    });
                 }
             }
             Err(e) => {
+                if !app_id.is_empty() {
+                    self.discord_ipc.set_activity(&app_id, &clean_title, "In Game", None);
+                }
                 self.add_log(&format!("Ошибка запуска процесса {}: {}", clean_exe, e));
                 self.is_running = true;
                 self.batch_started_at = Some(Instant::now());
@@ -1004,7 +1137,7 @@ impl GameFarmerApp {
             if let Some(parent) = target_stub.parent() {
                 cmd.current_dir(parent);
             }
-
+            self.configure_stub_icon_env(&mut cmd, &db_game.name, &db_game.id);
             cmd.arg(&db_game.name);
 
             match cmd.spawn() {
@@ -1189,6 +1322,27 @@ mod tests {
         assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "гта"));
         assert!(game_matches_query("Grand Theft Auto VI", "gta6.exe", "gta"));
     }
+
+    #[test]
+    fn custom_fonts_support_all_ui_emojis() {
+        let fonts = egui::epaint::text::Fonts::new(1.0, 2048, build_custom_font_definitions());
+        let mut lock = fonts.lock();
+        let samples = [
+            "🎮", "🎯", "✨", "⚠️", "⏹", "★", "☆", "●", "○", "💥", "⚡", "📦", "🎨",
+            "↻", "☰", "⊞", "❐", "□", "✕", "⚙", "▲", "▼", "↗", "←", "■", "—",
+        ];
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let font_id = egui::FontId::new(14.0, family.clone());
+            for sample in samples {
+                assert!(
+                    lock.fonts.has_glyphs(&font_id, sample),
+                    "Шрифт {:?} не поддерживает символ {:?}",
+                    family,
+                    sample
+                );
+            }
+        }
+    }
 }
 
 impl eframe::App for GameFarmerApp {
@@ -1249,9 +1403,24 @@ impl eframe::App for GameFarmerApp {
                     }
                     tray::TrayAction::Quit => {
                         self.is_quitting = true;
+                        self.stop_all_active_games();
+                        self.discord_ipc.clear_activity();
+                        self.saved_settings.save();
+                        self.tray_manager = None;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
                     }
                 }
+            }
+        }
+
+        // Повторный запуск exe выводит уже открытый экземпляр вместо дубля в трее
+        if let Some(ref guard) = self.single_instance {
+            if guard.poll_show_requested() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
 
@@ -1295,1463 +1464,7 @@ impl eframe::App for GameFarmerApp {
             }
         }
 
-        // Применяем масштаб интерфейса
-        ctx.set_pixels_per_point(self.ui_scale.factor());
-        let t = get_i18n(self.language);
-
-        let bg_frame = egui::Frame::none()
-            .fill(Color32::from_rgb(18, 19, 23))
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0));
-
-        egui::CentralPanel::default().frame(bg_frame).show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-
-            // ==========================================
-            // 1. ХЕДЕР
-            // ==========================================
-            ui.horizontal(|ui| {
-                let header_title = if t.title.starts_with("🎮") {
-                    t.title.to_string()
-                } else {
-                    format!("🎮 {}", t.title)
-                };
-                ui.label(
-                    RichText::new(header_title)
-                        .size(13.0)
-                        .strong()
-                        .color(Color32::from_rgb(220, 220, 225)),
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.is_running {
-                        let count = self.running_processes.len();
-                        let text = if count == 1 {
-                            t.active_single.to_string()
-                        } else {
-                            t.active_multi.replace("{}", &count.to_string())
-                        };
-                        let clean_active = text.trim_matches(|c| c == '[' || c == ']');
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(clean_active)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(56, 172, 88))
-                                    .strong(),
-                            );
-                            ui.label(
-                                RichText::new("●")
-                                    .size(10.0)
-                                    .color(Color32::from_rgb(50, 225, 110)),
-                            );
-                        });
-                    } else {
-                        let clean_stopped = match self.language {
-                            Language::Ru => "ОСТАНОВЛЕНО",
-                            Language::Uk => "ЗУПИНЕНО",
-                            Language::En => "STOPPED",
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(clean_stopped)
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(130, 135, 145)),
-                            );
-                            ui.label(
-                                RichText::new("●")
-                                    .size(10.0)
-                                    .color(Color32::from_rgb(110, 115, 125)),
-                            );
-                        });
-                    }
-                });
-            });
-
-            // ==========================================
-            // 1.5. УВЕДОМЛЕНИЕ ОБ ОБНОВЛЕНИИ (ИН-ПЛЕЙС БАННЕР)
-            // ==========================================
-            match self.updater.status.clone() {
-                UpdateStatus::Available { version, changelog, download_url } => {
-                    let banner_frame = egui::Frame::none()
-                        .fill(Color32::from_rgb(18, 32, 45))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 140, 255)))
-                        .rounding(Rounding::same(4.0))
-                        .inner_margin(egui::Margin::symmetric(10.0, 6.0));
-
-                    banner_frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // 1. Текст слева: название версии
-                            let banner_text = t.update_available_banner.replace("{}", &version);
-                            ui.label(
-                                RichText::new(banner_text)
-                                    .size(12.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(90, 195, 255)),
-                            );
-
-                            // Описание (changelog), ограниченное так, чтобы оставалось 210px под кнопку
-                            if !changelog.is_empty() {
-                                let max_changelog_w = (ui.available_width() - 210.0).max(0.0);
-                                if max_changelog_w > 40.0 {
-                                    let changelog_label = egui::Label::new(
-                                        RichText::new(format!("({})", changelog))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(180, 205, 220)),
-                                    ).truncate();
-                                    ui.add_sized(Vec2::new(max_changelog_w, 20.0), changelog_label);
-                                }
-                            }
-
-                            // 2. Кнопка на правом краю
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let update_btn = egui::Button::new(
-                                    RichText::new(t.btn_apply_update)
-                                        .size(11.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgb(0, 122, 204))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(30, 150, 240)))
-                                .rounding(Rounding::same(3.0));
-
-                                if ui.add_sized(Vec2::new(190.0, 24.0), update_btn).clicked() {
-                                    self.updater.start_download_and_install(download_url, version.clone());
-                                    self.add_log(&format!("Загрузка инсталлятора обновления {} с GitHub...", version));
-                                }
-                            });
-                        });
-                    });
-                    ui.add_space(2.0);
-                }
-                UpdateStatus::Downloading { version, progress, downloaded, total } => {
-                    let banner_frame = egui::Frame::none()
-                        .fill(Color32::from_rgb(18, 35, 30))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0, 180, 120)))
-                        .rounding(Rounding::same(4.0))
-                        .inner_margin(egui::Margin::symmetric(10.0, 6.0));
-
-                    banner_frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let mb_down = downloaded as f64 / 1_048_576.0;
-                            let mb_total = total as f64 / 1_048_576.0;
-                            let text = format!("Скачивание v{}: {:.0}% ({:.1} / {:.1} МБ)", version, progress * 100.0, mb_down, mb_total);
-                            ui.label(
-                                RichText::new(text)
-                                    .size(12.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(100, 235, 160)),
-                            );
-
-                            ui.add(egui::ProgressBar::new(progress).desired_width(180.0));
-                        });
-                    });
-                    ui.add_space(2.0);
-                }
-                UpdateStatus::Installing => {
-                    let banner_frame = egui::Frame::none()
-                        .fill(Color32::from_rgb(25, 25, 40))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(120, 120, 240)))
-                        .rounding(Rounding::same(4.0))
-                        .inner_margin(egui::Margin::symmetric(10.0, 6.0));
-
-                    banner_frame.show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Запуск инсталлятора и перезапуск программы...")
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(160, 180, 255)),
-                        );
-                    });
-                    ui.add_space(2.0);
-                }
-                _ => {}
-            }
-
-            // ==========================================
-            // 2. ВКЛАДКИ (MINIMAL UNDERLINE TABS - АДАПТИВНАЯ ШИРИНА)
-            // ==========================================
-            let tab_bar_frame = egui::Frame::none()
-                .fill(Color32::from_rgb(20, 22, 26))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 40, 48)))
-                .rounding(Rounding::same(6.0))
-                .inner_margin(egui::Margin::symmetric(4.0, 3.0));
-
-            tab_bar_frame.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                    // Clean labels without leading "1. ", "2. ", "3. "
-                    let strip_num = |s: &'static str| -> &'static str {
-                        if s.starts_with("1. ") || s.starts_with("2. ") || s.starts_with("3. ") {
-                            &s[3..]
-                        } else {
-                            s
-                        }
-                    };
-
-                    let tabs = [
-                        (AppMode::SingleGame, strip_num(t.tab_search)),
-                        (AppMode::RandomBatch, strip_num(t.tab_random)),
-                        (AppMode::Settings, strip_num(t.tab_settings)),
-                    ];
-
-                    let avail_w = ui.available_width();
-                    let tab_w = ((avail_w - 8.0) / 3.0).clamp(90.0, 240.0);
-
-                    for (mode, label) in tabs {
-                        let is_active = self.app_mode == mode;
-                        let text_color = if is_active {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(150, 155, 165)
-                        };
-
-                        let btn = egui::Button::new(
-                            RichText::new(label)
-                                .size(12.0)
-                                .strong()
-                                .color(text_color),
-                        )
-                        .fill(if is_active { Color32::from_rgb(36, 40, 50) } else { Color32::TRANSPARENT })
-                        .stroke(Stroke::new(1.0_f32, if is_active { Color32::from_rgb(52, 58, 72) } else { Color32::TRANSPARENT }))
-                        .rounding(Rounding::same(5.0));
-
-                        let resp = ui.add_sized(Vec2::new(tab_w, 32.0), btn);
-
-                        // Hover-подсветка при наведении
-                        if resp.hovered() && !is_active {
-                            let hover_rect = resp.rect.shrink2(Vec2::new(2.0, 3.0));
-                            ui.painter().rect_filled(
-                                hover_rect,
-                                Rounding::same(4.0),
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-                            );
-                        }
-
-                        // Светящаяся синяя полоска снизу активной вкладки
-                        if is_active {
-                            let line_rect = egui::Rect::from_min_max(
-                                egui::pos2(resp.rect.min.x + 8.0, resp.rect.max.y - 2.5),
-                                egui::pos2(resp.rect.max.x - 8.0, resp.rect.max.y),
-                            );
-                            ui.painter().rect_filled(
-                                line_rect,
-                                Rounding::same(1.5),
-                                Color32::from_rgb(70, 130, 240),
-                            );
-                        }
-
-                        if resp.clicked() {
-                            self.app_mode = mode;
-                        }
-                    }
-                });
-            });
-
-            // ==========================================
-            // 3. АКТИВНЫЙ СТАТУС (ЕСЛИ ИГРА ЗАПУЩЕНА - АНТИ-ОБРЕЗКА)
-            // ==========================================
-            if self.is_running && !self.running_processes.is_empty() {
-                let active_frame = egui::Frame::none()
-                    .fill(Color32::from_rgb(20, 36, 24))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(35, 165, 90)))
-                    .rounding(Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0));
-
-                active_frame.show(ui, |ui| {
-                    let total_w = ui.available_width();
-                    let btn_w = 120.0;
-                    let text_w = (total_w - btn_w - 16.0).max(100.0);
-
-                    ui.horizontal(|ui| {
-                        // 1. Левая часть: текстовая информация
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(text_w, 32.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.vertical(|ui| {
-                                    if self.running_processes.len() == 1 {
-                                        let proc = &self.running_processes[0];
-                                        let title_label = egui::Label::new(
-                                            RichText::new(format!("{} {}", t.active_card_title, proc.game.name))
-                                                .size(12.5)
-                                                .strong()
-                                                .color(Color32::from_rgb(70, 215, 115)),
-                                        ).truncate();
-                                        ui.add(title_label);
-
-                                        let info_label = egui::Label::new(
-                                            RichText::new(t.active_process_info.replace("{}", &proc.game.exe_name))
-                                                .size(10.0)
-                                                .color(Color32::from_rgb(160, 180, 160)),
-                                        ).truncate();
-                                        ui.add(info_label);
-                                    } else {
-                                        let title_label = egui::Label::new(
-                                            RichText::new(format!("Активно в Discord: {} игр", self.running_processes.len()))
-                                                .size(12.0)
-                                                .strong()
-                                                .color(Color32::from_rgb(70, 215, 115)),
-                                        ).truncate();
-                                        ui.add(title_label);
-
-                                        ui.label(
-                                            RichText::new("Все запущенные игры учитываются Discord")
-                                                .size(10.0)
-                                                .color(Color32::from_rgb(160, 180, 160)),
-                                        );
-                                    }
-                                });
-                            },
-                        );
-
-                        // 2. Распорка для выталкивания кнопки Остановить строго вправо без вертикального растяжения
-                        let remaining_w = ui.available_width() - btn_w;
-                        if remaining_w > 0.0 {
-                            ui.add_space(remaining_w);
-                        }
-
-                        let stop_btn = egui::Button::new(
-                            RichText::new(t.btn_stop)
-                                .size(11.5)
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(Color32::from_rgb(218, 55, 60))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(240, 80, 85)))
-                        .rounding(Rounding::same(4.0));
-
-                        if ui.add_sized(Vec2::new(btn_w, 28.0), stop_btn).clicked() {
-                            self.stop_farming();
-                        }
-                    });
-
-                    ui.add_space(3.0);
-                    // Уведомление о тихом фоновом запуске без окон и иконок в панели задач
-                    ui.label(
-                        RichText::new(t.silent_running_hint)
-                            .size(10.0)
-                            .color(Color32::from_rgb(130, 185, 145)),
-                    );
-
-                    // Countdown & progress bar
-                    let total_secs = (self.interval_minutes as u64) * 60;
-                    let elapsed_secs = self.batch_started_at.map_or(0, |t| t.elapsed().as_secs());
-                    let progress = if total_secs > 0 {
-                        (elapsed_secs as f32 / total_secs as f32).min(1.0)
-                    } else {
-                        0.0
-                    };
-                    let remaining_secs = total_secs.saturating_sub(elapsed_secs);
-                    let rem_m = remaining_secs / 60;
-                    let rem_s = remaining_secs % 60;
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let countdown_text = if self.app_mode == AppMode::SingleGame {
-                            t.remaining
-                                .replace("{:02}:{:02}", &format!("{:02}:{:02}", rem_m, rem_s))
-                                .replace("{}", &self.interval_minutes.to_string())
-                        } else {
-                            format!("До ротации: {:02}:{:02} (из {} мин)", rem_m, rem_s, self.interval_minutes)
-                        };
-                        ui.label(RichText::new(countdown_text).size(11.0).color(Color32::from_rgb(200, 215, 200)));
-
-                        let total_h = self.total_seconds_farmed / 3600;
-                        let total_m = (self.total_seconds_farmed % 3600) / 60;
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let text = t.total_farmed
-                                .replacen("{}", &total_h.to_string(), 1)
-                                .replacen("{}", &total_m.to_string(), 1);
-                            ui.label(RichText::new(text).size(10.5).color(Color32::from_rgb(150, 165, 150)));
-                        });
-                    });
-
-                    ui.add_space(2.0);
-                    let pbar = egui::ProgressBar::new(progress)
-                        .fill(Color32::from_rgb(35, 165, 90))
-                        .show_percentage();
-                    ui.add(pbar);
-
-                    if let Some(ref q_status) = self.active_quest_status {
-                        ui.add_space(3.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("🎯 Квест Discord:")
-                                    .size(10.5)
-                                    .strong()
-                                    .color(Color32::from_rgb(180, 220, 255)),
-                            );
-                            ui.label(
-                                RichText::new(q_status)
-                                    .size(10.5)
-                                    .strong()
-                                    .color(Color32::from_rgb(100, 255, 180)),
-                            );
-                        });
-                    }
-                });
-            }
-
-            // ==========================================
-            // 4. ПАНЕЛЬ ВРЕМЕНИ РАБОТЫ (ТОЛЬКО ДЛЯ РЕЖИМА 1 - ВЫПОЛНЕНИЕ ЗАДАНИЙ)
-            // ==========================================
-            if self.app_mode == AppMode::SingleGame {
-                let toolbar_frame = egui::Frame::none()
-                    .fill(Color32::from_rgb(20, 22, 26))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 40, 48)))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 7.0));
-
-                toolbar_frame.show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new("Время работы:")
-                                .size(11.5)
-                                .color(Color32::from_rgb(180, 185, 195)),
-                        );
-
-                        let presets = [
-                            ("2 мин", 2),
-                            ("15 мин", 15),
-                            ("30 мин", 30),
-                            ("1 ч", 60),
-                            ("2 ч", 120),
-                        ];
-
-                        for (label, mins) in presets {
-                            let is_active = self.interval_minutes == mins;
-                            let btn = egui::Button::new(
-                                RichText::new(label)
-                                    .size(11.0)
-                                    .strong()
-                                    .color(if is_active { Color32::WHITE } else { Color32::from_rgb(175, 180, 190) }),
-                            )
-                            .fill(if is_active { Color32::from_rgb(26, 32, 44) } else { Color32::from_rgb(26, 28, 34) })
-                            .stroke(Stroke::new(1.2_f32, if is_active { Color32::from_rgb(70, 130, 220) } else { Color32::from_rgb(45, 48, 58) }))
-                            .rounding(Rounding::same(4.0));
-
-                            if ui.add_sized(Vec2::new(48.0, 24.0), btn).clicked() {
-                                self.interval_minutes = mins;
-                            }
-                        }
-
-                        ui.add_space(4.0);
-                        let slider_w = ui.available_width().clamp(60.0, 125.0);
-                        ui.add_sized(Vec2::new(slider_w, 20.0), egui::Slider::new(&mut self.interval_minutes, 1..=120).show_value(false));
-
-                        let time_str = if self.interval_minutes >= 60 && self.interval_minutes % 60 == 0 {
-                            format!("{} ч", self.interval_minutes / 60)
-                        } else {
-                            format!("{} мин", self.interval_minutes)
-                        };
-
-                        let exact_frame = egui::Frame::none()
-                            .fill(Color32::from_rgb(26, 28, 34))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 48, 58)))
-                            .rounding(Rounding::same(4.0))
-                            .inner_margin(egui::Margin::symmetric(6.0, 3.0));
-
-                        exact_frame.show(ui, |ui| {
-                            ui.label(
-                                RichText::new(time_str)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(180, 185, 195)),
-                            );
-                        });
-
-                        ui.label(
-                            RichText::new("Точно")
-                                .size(11.0)
-                                .color(Color32::from_rgb(140, 145, 155)),
-                        );
-                    });
-                });
-            }
-
-            // ==========================================
-            // 5. КОНТЕНТ ВЫБРАННОЙ ВКЛАДКИ
-            // ==========================================
-            match self.app_mode {
-                AppMode::SingleGame => {
-                    // Строка поиска + кнопки управления (адаптивная ширина под любое разрешение)
-                    let avail_search = ui.available_width();
-                    let is_narrow = avail_search < 500.0;
-                    let clear_btn_w = 68.0;
-                    let fav_btn_w = if is_narrow { 110.0 } else { 145.0 };
-                    let spacing = ui.spacing().item_spacing.x * 2.0;
-                    let search_w = (avail_search - clear_btn_w - fav_btn_w - spacing - 8.0).max(70.0);
-
-                    ui.horizontal(|ui| {
-                        let search_box = egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text(t.search_placeholder)
-                            .desired_width(search_w);
-                        ui.add(search_box);
-
-                        let clear_btn = egui::Button::new(
-                            RichText::new(t.btn_clear)
-                                .size(11.0)
-                                .color(Color32::from_rgb(180, 185, 195)),
-                        )
-                        .fill(Color32::from_rgb(26, 28, 34))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 48, 58)))
-                        .rounding(Rounding::same(4.0));
-
-                        if ui.add_sized(Vec2::new(clear_btn_w, 26.0), clear_btn).clicked() {
-                            self.search_query.clear();
-                        }
-
-                        let fav_count = self.favorite_games.len();
-                        let fav_title = if is_narrow {
-                            format!("★ ({})", fav_count)
-                        } else {
-                            format!("★ Избранное ({})", fav_count)
-                        };
-
-                        let fav_filter_btn = egui::Button::new(
-                            RichText::new(fav_title)
-                                .size(11.0)
-                                .color(if self.filter_only_favorites { Color32::from_rgb(255, 215, 0) } else { Color32::from_rgb(180, 185, 195) }),
-                        )
-                        .fill(if self.filter_only_favorites { Color32::from_rgb(45, 40, 20) } else { Color32::from_rgb(26, 28, 34) })
-                        .stroke(Stroke::new(1.0_f32, if self.filter_only_favorites { Color32::from_rgb(200, 170, 0) } else { Color32::from_rgb(45, 48, 58) }))
-                        .rounding(Rounding::same(4.0));
-
-                        if ui.add_sized(Vec2::new(fav_btn_w, 26.0), fav_filter_btn).clicked() {
-                            self.filter_only_favorites = !self.filter_only_favorites;
-                            self.last_search_query.clear();
-                        }
-                    });
-
-                    ui.add_space(2.0);
-
-                    // Обновляем фильтр при изменении поискового запроса или фильтра избранного
-                    let clean_query = self.search_query.trim().to_lowercase();
-                    let filter_state_key = format!("{}:{}", clean_query, self.filter_only_favorites);
-                    if filter_state_key != self.last_search_query {
-                        self.last_search_query = filter_state_key.clone();
-                        if clean_query.is_empty() && !self.filter_only_favorites {
-                            self.filtered_indices.clear();
-                        } else {
-                            self.filtered_indices = self.all_games
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, g)| {
-                                    if self.filter_only_favorites && !self.favorite_games.contains(&g.name) {
-                                        return false;
-                                    }
-                                    if clean_query.is_empty() {
-                                        return true;
-                                    }
-                                    game_matches_query(&g.name, &g.exe, &clean_query)
-                                })
-                                .map(|(i, _)| i)
-                                .collect();
-                        }
-                    }
-
-                    let is_unfiltered = clean_query.is_empty() && !self.filter_only_favorites;
-                    let total_items = if is_unfiltered {
-                        self.all_games.len()
-                    } else {
-                        self.filtered_indices.len()
-                    };
-
-                    let sub_hint = if self.filter_only_favorites {
-                        format!("Доступно {} избранных игр", total_items)
-                    } else if is_unfiltered {
-                        format!("Доступно {} игр", total_items)
-                    } else {
-                        format!("Найдено {} из {} игр", total_items, self.all_games.len())
-                    };
-                    ui.label(RichText::new(sub_hint).size(11.5).color(Color32::from_rgb(140, 145, 155)));
-
-                    let mut game_to_launch: Option<(String, String, String)> = None;
-                    let mut fav_to_toggle: Option<String> = None;
-                    let mut should_stop = false;
-                    let running_exes: HashSet<String> = self.running_processes.iter().map(|rp| rp.game.exe_name.to_lowercase()).collect();
-
-                    if total_items == 0 {
-                        ui.add_space(20.0);
-                        let empty_text = if self.filter_only_favorites {
-                            t.fav_empty_msg
-                        } else {
-                            t.no_results
-                        };
-                        ui.label(
-                            RichText::new(empty_text)
-                                .size(12.0)
-                                .color(Color32::from_rgb(220, 130, 130)),
-                        );
-                    } else {
-                        // Точная высота карточки без межэлементного интервала по правилам rust-gui
-                        let card_height = 40.0;
-
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show_rows(ui, card_height, total_items, |ui, row_range| {
-                                ui.spacing_mut().item_spacing.y = 4.0;
-                                let full_row_w = ui.available_width() - 2.0;
-
-                                for row_idx in row_range {
-                                    let (g_name, g_exe, g_id) = if is_unfiltered {
-                                        let item = &self.all_games[row_idx];
-                                        (item.name.clone(), item.exe.clone(), item.id.clone())
-                                    } else {
-                                        let item = &self.all_games[self.filtered_indices[row_idx]];
-                                        (item.name.clone(), item.exe.clone(), item.id.clone())
-                                    };
-
-                                    let is_active = if !g_exe.is_empty() {
-                                        running_exes.contains(&g_exe.to_lowercase())
-                                    } else {
-                                        self.running_processes.iter().any(|rp| rp.game.name == g_name)
-                                    };
-
-                                    let row_frame = egui::Frame::none()
-                                        .fill(if is_active {
-                                            Color32::from_rgb(22, 36, 26)
-                                        } else {
-                                            Color32::from_rgb(20, 22, 26)
-                                        })
-                                        .stroke(Stroke::new(1.0_f32, if is_active {
-                                            Color32::from_rgb(45, 120, 80)
-                                        } else {
-                                            Color32::from_rgb(38, 40, 48)
-                                        }))
-                                        .rounding(Rounding::same(6.0))
-                                        .inner_margin(egui::Margin::symmetric(14.0, 6.0));
-
-                                    row_frame.show(ui, |ui| {
-                                        ui.set_width(full_row_w);
-                                        ui.set_min_width(full_row_w);
-                                        ui.set_height(26.0);
-
-                                        // Двусторонний слой: кнопка прижимается строго вправо, текст занимает весь остаток слева
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            let btn_w = if full_row_w < 440.0 { 115.0 } else { 135.0 };
-                                            if is_active {
-                                                let stop_btn = egui::Button::new(
-                                                    RichText::new("⏹ Остановить")
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(Color32::WHITE),
-                                                )
-                                                .fill(Color32::from_rgb(180, 45, 45))
-                                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(220, 60, 60)))
-                                                .rounding(Rounding::same(5.0));
-
-                                                if ui.add_sized(Vec2::new(btn_w, 26.0), stop_btn).clicked() {
-                                                    should_stop = true;
-                                                }
-                                            } else {
-                                                let launch_label = if self.interval_minutes >= 60 && self.interval_minutes % 60 == 0 {
-                                                    format!("Запустить на {}ч", self.interval_minutes / 60)
-                                                } else {
-                                                    format!("Запустить на {}м", self.interval_minutes)
-                                                };
-
-                                                let launch_btn = egui::Button::new(
-                                                    RichText::new(launch_label)
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(Color32::from_rgb(225, 245, 230)),
-                                                )
-                                                .fill(Color32::from_rgb(48, 92, 68))
-                                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(65, 125, 95)))
-                                                .rounding(Rounding::same(5.0));
-
-                                                if ui.add_sized(Vec2::new(btn_w, 26.0), launch_btn).clicked() {
-                                                    game_to_launch = Some((g_name.clone(), g_exe.clone(), g_id.clone()));
-                                                }
-                                            }
-
-                                            ui.add_space(8.0);
-
-                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                                let is_fav = self.favorite_games.contains(&g_name);
-                                                let star_color = if is_fav { Color32::from_rgb(255, 215, 0) } else { Color32::from_rgb(115, 120, 130) };
-                                                let star_btn = egui::Button::new(
-                                                    RichText::new(if is_fav { "★" } else { "☆" })
-                                                        .size(13.0)
-                                                        .color(star_color),
-                                                )
-                                                .fill(Color32::TRANSPARENT)
-                                                .frame(false);
-
-                                                if ui.add(star_btn).clicked() {
-                                                    fav_to_toggle = Some(g_name.clone());
-                                                }
-
-                                                ui.add_space(4.0);
-
-                                                ui.label(
-                                                    RichText::new(format!("#{}", row_idx + 1))
-                                                        .size(11.0)
-                                                        .color(Color32::from_rgb(120, 125, 135)),
-                                                );
-
-                                                ui.add_space(8.0);
-
-                                                let text_color = if is_active {
-                                                    Color32::from_rgb(70, 215, 115)
-                                                } else {
-                                                    Color32::WHITE
-                                                };
-                                                let name_label = egui::Label::new(
-                                                    RichText::new(&g_name).strong().size(12.0).color(text_color),
-                                                ).truncate();
-                                                ui.add(name_label);
-
-                                                if is_active {
-                                                    ui.add_space(6.0);
-                                                    ui.label(
-                                                        RichText::new("[АКТИВНО]")
-                                                            .size(10.0)
-                                                            .strong()
-                                                            .color(Color32::from_rgb(70, 215, 115)),
-                                                    );
-                                                }
-                                            });
-                                        });
-                                    });
-                                }
-                            });
-                    }
-
-                    if let Some(game_name) = fav_to_toggle {
-                        if self.favorite_games.contains(&game_name) {
-                            self.favorite_games.remove(&game_name);
-                            self.add_log(&format!("Удалено из избранного: '{}'", game_name));
-                        } else {
-                            self.favorite_games.insert(game_name.clone());
-                            self.add_log(&format!("Добавлено в избранное: '{}'", game_name));
-                        }
-                        self.last_search_query.clear();
-                    }
-
-                    if should_stop {
-                        self.stop_farming();
-                    }
-                    if let Some((name, exe, id)) = game_to_launch {
-                        self.launch_single_game(name, exe, id);
-                    }
-                }
-
-                AppMode::RandomBatch => {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let rand_frame = egui::Frame::none()
-                                .fill(Color32::from_rgb(20, 22, 26))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 40, 48)))
-                                .rounding(Rounding::same(6.0))
-                                .inner_margin(egui::Margin::symmetric(16.0, 14.0));
-
-                            rand_frame.show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(t.random_title)
-                                        .size(13.5)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                );
-                                ui.add_space(3.0);
-                                ui.label(
-                                    RichText::new(t.random_desc.replace("{}", &self.interval_minutes.to_string()))
-                                        .size(11.5)
-                                        .color(Color32::from_rgb(160, 160, 160)),
-                                );
-
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                // 1. Пул игр для ротации
-                                let sec1_title = match self.language {
-                                    Language::Ru => "Пул игр:",
-                                    Language::Uk => "Пул ігор:",
-                                    Language::En => "Game pool:",
-                                };
-                                ui.label(
-                                    RichText::new(sec1_title)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(200, 200, 200)),
-                                );
-                                ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    let pool_btn_w = ((ui.available_width() - 8.0) / 2.0).clamp(130.0, 190.0);
-                                    let all_selected = !self.random_only_favorites;
-                                    let all_btn = egui::Button::new(
-                                        RichText::new(t.fav_mode_all)
-                                            .size(11.0)
-                                            .strong()
-                                            .color(if all_selected { Color32::WHITE } else { Color32::from_rgb(170, 170, 170) }),
-                                    )
-                                    .fill(if all_selected { Color32::from_rgb(0, 122, 204) } else { Color32::from_rgb(26, 28, 34) })
-                                    .stroke(Stroke::new(1.0_f32, if all_selected { Color32::from_rgb(30, 144, 255) } else { Color32::from_rgb(45, 48, 58) }))
-                                    .rounding(Rounding::same(4.0));
-
-                                    if ui.add_sized(Vec2::new(pool_btn_w, 28.0), all_btn).clicked() {
-                                        self.random_only_favorites = false;
-                                    }
-
-                                    let fav_count = self.favorite_games.len();
-                                    let fav_label = format!("★ {} ({})", t.fav_mode_only, fav_count);
-                                    let fav_selected = self.random_only_favorites;
-                                    let fav_btn = egui::Button::new(
-                                        RichText::new(fav_label)
-                                            .size(11.0)
-                                            .strong()
-                                            .color(if fav_selected { Color32::from_rgb(255, 230, 80) } else { Color32::from_rgb(170, 170, 170) }),
-                                    )
-                                    .fill(if fav_selected { Color32::from_rgb(50, 45, 20) } else { Color32::from_rgb(26, 28, 34) })
-                                    .stroke(Stroke::new(1.0_f32, if fav_selected { Color32::from_rgb(210, 180, 0) } else { Color32::from_rgb(45, 48, 58) }))
-                                    .rounding(Rounding::same(4.0));
-
-                                    if ui.add_sized(Vec2::new(pool_btn_w, 28.0), fav_btn).clicked() {
-                                        if fav_count == 0 {
-                                            self.add_log(t.fav_empty_msg);
-                                        } else {
-                                            self.random_only_favorites = true;
-                                        }
-                                    }
-                                });
-
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                // 2. Время ротации пачки игр
-                                let sec2_title = match self.language {
-                                    Language::Ru => "Интервал ротации:",
-                                    Language::Uk => "Інтервал ротації:",
-                                    Language::En => "Rotation interval:",
-                                };
-                                ui.label(
-                                    RichText::new(sec2_title)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(200, 200, 200)),
-                                );
-                                ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    let time_presets = [
-                                        ("5 мин", 5),
-                                        ("10 мин", 10),
-                                        ("15 мин", 15),
-                                        ("20 мин", 20),
-                                    ];
-                                    for (lbl, val) in time_presets {
-                                        let is_sel = self.interval_minutes == val;
-                                        let btn = egui::Button::new(
-                                            RichText::new(lbl)
-                                                .size(11.0)
-                                                .strong()
-                                                .color(if is_sel { Color32::WHITE } else { Color32::from_rgb(175, 180, 190) }),
-                                        )
-                                        .fill(if is_sel { Color32::from_rgb(0, 122, 204) } else { Color32::from_rgb(26, 28, 34) })
-                                        .stroke(Stroke::new(1.0_f32, if is_sel { Color32::from_rgb(30, 144, 255) } else { Color32::from_rgb(45, 48, 58) }))
-                                        .rounding(Rounding::same(4.0));
-
-                                        if ui.add(btn).clicked() {
-                                            self.interval_minutes = val;
-                                        }
-                                    }
-                                    ui.add_space(6.0);
-                                    ui.add(egui::Slider::new(&mut self.interval_minutes, 1..=20).suffix(" мин"));
-                                });
-
-                                if self.interval_minutes < 6 {
-                                    ui.add_space(4.0);
-                                    let warn_msg = match self.language {
-                                        Language::Ru => "Интервал Discord heartbeat — 5 мин. Рекомендуется от 10 до 15 мин.",
-                                        Language::Uk => "Інтервал Discord heartbeat — 5 хв. Рекомендується від 10 до 15 хв.",
-                                        Language::En => "Discord heartbeat interval is 5 min. Recommended: 10 to 15 min.",
-                                    };
-                                    ui.label(
-                                        RichText::new(warn_msg)
-                                            .size(10.5)
-                                            .color(Color32::from_rgb(240, 185, 60)),
-                                    );
-                                }
-
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                // 3. Одновременный запуск (размер пачки)
-                                let sec3_title = match self.language {
-                                    Language::Ru => "Количество игр:",
-                                    Language::Uk => "Кількість ігор:",
-                                    Language::En => "Simultaneous games:",
-                                };
-                                ui.label(
-                                    RichText::new(sec3_title)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(200, 200, 200)),
-                                );
-                                ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    let batch_presets = [
-                                        ("4 игры", 4),
-                                        ("6 игр", 6),
-                                        ("8 игр", 8),
-                                        ("12 игр", 12),
-                                        ("16 игр", 16),
-                                    ];
-                                    for (lbl, val) in batch_presets {
-                                        let is_sel = self.batch_size == val;
-                                        let btn = egui::Button::new(
-                                            RichText::new(lbl)
-                                                .size(11.0)
-                                                .strong()
-                                                .color(if is_sel { Color32::WHITE } else { Color32::from_rgb(175, 180, 190) }),
-                                        )
-                                        .fill(if is_sel { Color32::from_rgb(0, 122, 204) } else { Color32::from_rgb(26, 28, 34) })
-                                        .stroke(Stroke::new(1.0_f32, if is_sel { Color32::from_rgb(30, 144, 255) } else { Color32::from_rgb(45, 48, 58) }))
-                                        .rounding(Rounding::same(4.0));
-
-                                        if ui.add(btn).clicked() {
-                                            self.batch_size = val;
-                                        }
-                                    }
-                                    ui.add_space(6.0);
-                                    ui.add(egui::Slider::new(&mut self.batch_size, 1..=16).suffix(""));
-                                });
-
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                // 4. Управление и статус прокачки
-                                let sec4_title = match self.language {
-                                    Language::Ru => "Управление:",
-                                    Language::Uk => "Керування:",
-                                    Language::En => "Controls:",
-                                };
-                                ui.label(
-                                    RichText::new(sec4_title)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(200, 200, 200)),
-                                );
-                                ui.add_space(8.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    let is_batch_active = self.is_running && self.app_mode == AppMode::RandomBatch;
-                                    let (btn_title, btn_color, btn_stroke) = if is_batch_active {
-                                        (t.btn_change_random, Color32::from_rgb(45, 75, 115), Color32::from_rgb(60, 130, 200))
-                                    } else {
-                                        (t.btn_start_random, Color32::from_rgb(0, 122, 204), Color32::from_rgb(30, 144, 255))
-                                    };
-
-                                    let start_rand_btn = egui::Button::new(
-                                        RichText::new(btn_title)
-                                            .size(12.5)
-                                            .strong()
-                                            .color(Color32::WHITE),
-                                    )
-                                    .fill(btn_color)
-                                    .stroke(Stroke::new(1.0_f32, btn_stroke))
-                                    .rounding(Rounding::same(4.0));
-
-                                    let start_w = ui.available_width().clamp(160.0, 260.0);
-                                    if ui.add_sized(Vec2::new(start_w, 36.0), start_rand_btn).clicked() {
-                                        self.launch_random_batch();
-                                    }
-
-                                    if is_batch_active {
-                                        ui.add_space(8.0);
-                                        let stop_btn = egui::Button::new(
-                                            RichText::new(t.btn_stop)
-                                                .size(11.5)
-                                                .strong()
-                                                .color(Color32::WHITE),
-                                        )
-                                        .fill(Color32::from_rgb(180, 40, 40))
-                                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(220, 60, 60)))
-                                        .rounding(Rounding::same(4.0));
-
-                                        if ui.add_sized(Vec2::new(110.0, 36.0), stop_btn).clicked() {
-                                            self.stop_farming();
-                                        }
-                                    }
-
-                                    ui.add_space(14.0);
-                                    ui.label(
-                                        RichText::new(t.farmed_count.replace("{}", &self.farmed_history_names.len().to_string()))
-                                            .size(12.0)
-                                            .color(Color32::from_rgb(56, 172, 88))
-                                            .strong(),
-                                    );
-
-                                    if !self.farmed_history_names.is_empty() {
-                                        ui.add_space(8.0);
-                                        let reset_btn = egui::Button::new(
-                                            RichText::new(t.btn_reset_farmed)
-                                                .size(11.0)
-                                                .color(Color32::from_rgb(200, 200, 200)),
-                                        )
-                                        .fill(Color32::from_rgb(26, 28, 34))
-                                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 48, 58)))
-                                        .rounding(Rounding::same(4.0));
-
-                                        if ui.add_sized(Vec2::new(70.0, 28.0), reset_btn).clicked() {
-                                            self.farmed_history_names.clear();
-                                            self.add_log("История прокачанных игр сброшена.");
-                                        }
-                                    }
-                                });
-
-                                // 5. Текущие процессы в Discord (при активном фарме)
-                                if self.is_running && !self.running_processes.is_empty() {
-                                    ui.add_space(10.0);
-                                    ui.separator();
-                                    ui.add_space(8.0);
-
-                                    // Обратный отсчёт ротации пачки
-                                    let total_secs = (self.interval_minutes as u64) * 60;
-                                    let elapsed_secs = self.batch_started_at.map_or(0, |t| t.elapsed().as_secs());
-                                    let progress = if total_secs > 0 {
-                                        (elapsed_secs as f32 / total_secs as f32).clamp(0.0, 1.0)
-                                    } else {
-                                        0.0
-                                    };
-                                    let rem_secs = total_secs.saturating_sub(elapsed_secs);
-                                    let rem_m = rem_secs / 60;
-                                    let rem_s = rem_secs % 60;
-
-                                    let sec5_title = match self.language {
-                                        Language::Ru => format!("5. Текущие процессы в Discord (ротация через {:02}:{:02}):", rem_m, rem_s),
-                                        Language::Uk => format!("5. Поточні процеси в Discord (ротація через {:02}:{:02}):", rem_m, rem_s),
-                                        Language::En => format!("5. Active processes in Discord (rotation in {:02}:{:02}):", rem_m, rem_s),
-                                    };
-
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new(sec5_title)
-                                                .size(12.0)
-                                                .strong()
-                                                .color(Color32::from_rgb(170, 210, 240)),
-                                        );
-                                        ui.add_space(8.0);
-                                        ui.add(egui::ProgressBar::new(progress).desired_width(180.0));
-                                    });
-
-                                    ui.add_space(3.0);
-                                    ui.label(
-                                        RichText::new(t.silent_running_hint)
-                                            .size(10.5)
-                                            .color(Color32::from_rgb(130, 185, 145)),
-                                    );
-
-                                    ui.add_space(8.0);
-
-                                    let mut game_to_replace: Option<usize> = None;
-                                    let avail_w = ui.available_width();
-                                    let num_cols = if avail_w > 720.0 { 4 } else if avail_w > 460.0 { 2 } else { 1 };
-                                    let item_w = ((avail_w - (num_cols as f32 * 8.0)) / num_cols as f32).max(140.0);
-
-                                    egui::Grid::new("random_running_grid")
-                                        .num_columns(num_cols)
-                                        .spacing([8.0, 8.0])
-                                        .show(ui, |ui| {
-                                            for (idx, rp) in self.running_processes.iter().enumerate() {
-                                                let is_ipc_live = idx == self.current_ipc_index;
-                                                let border_color = if is_ipc_live {
-                                                    Color32::from_rgb(0, 200, 120)
-                                                } else {
-                                                    Color32::from_rgb(45, 48, 58)
-                                                };
-                                                let bg_color = if is_ipc_live {
-                                                    Color32::from_rgb(20, 36, 26)
-                                                } else {
-                                                    Color32::from_rgb(26, 28, 34)
-                                                };
-
-                                                let pill = egui::Frame::none()
-                                                    .fill(bg_color)
-                                                    .stroke(Stroke::new(1.0_f32, border_color))
-                                                    .rounding(Rounding::same(5.0))
-                                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0));
-
-                                                ui.vertical(|ui| {
-                                                    pill.show(ui, |ui| {
-                                                        ui.set_width(item_w);
-
-                                                        // Верхняя строка: статус IPC / Окно + кнопка смены
-                                                        ui.horizontal_wrapped(|ui| {
-                                                            if is_ipc_live {
-                                                                ui.label(
-                                                                    RichText::new(format!("● {}", t.broadcasting_badge))
-                                                                        .size(10.5)
-                                                                        .strong()
-                                                                        .color(Color32::from_rgb(70, 230, 140)),
-                                                                );
-                                                            } else {
-                                                                ui.label(
-                                                                    RichText::new(format!("○ {}", t.running_badge))
-                                                                        .size(10.5)
-                                                                        .color(Color32::from_rgb(140, 140, 140)),
-                                                                );
-                                                            }
-
-                                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                                let replace_btn = egui::Button::new(
-                                                                    RichText::new(t.btn_replace_game)
-                                                                        .size(10.0)
-                                                                        .color(Color32::from_rgb(190, 190, 200)),
-                                                                )
-                                                                .fill(Color32::from_rgb(38, 40, 48))
-                                                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 58, 68)))
-                                                                .rounding(Rounding::same(3.0));
-
-                                                                if ui.add(replace_btn).clicked() {
-                                                                    game_to_replace = Some(idx);
-                                                                }
-                                                            });
-                                                        });
-
-                                                        ui.add_space(4.0);
-
-                                                        // Название игры
-                                                        let name_label = egui::Label::new(
-                                                            RichText::new(&rp.game.name)
-                                                                .size(11.0)
-                                                                .strong()
-                                                                .color(Color32::WHITE),
-                                                        ).truncate();
-                                                        ui.add(name_label);
-                                                    });
-                                                });
-
-                                                if (idx + 1) % num_cols == 0 {
-                                                    ui.end_row();
-                                                }
-                                            }
-                                            ui.end_row();
-                                        });
-
-                                    if let Some(replace_idx) = game_to_replace {
-                                        self.replace_batch_game(replace_idx);
-                                    }
-                                }
-                            });
-                        });
-                }
-
-                AppMode::Settings => {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let settings_frame = egui::Frame::none()
-                                .fill(Color32::from_rgb(20, 22, 26))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 40, 48)))
-                                .rounding(Rounding::same(6.0))
-                                .inner_margin(egui::Margin::symmetric(16.0, 14.0));
-
-                            settings_frame.show(ui, |ui| {
-                        ui.label(
-                            RichText::new(t.settings_title)
-                                .size(13.5)
-                                .strong()
-                                .color(Color32::WHITE),
-                        );
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-
-                        // 1. Язык интерфейса
-                        ui.label(
-                            RichText::new(t.settings_lang)
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(200, 200, 200)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            let langs = [
-                                (Language::Ru, "RU Русский"),
-                                (Language::Uk, "UA Українська"),
-                                (Language::En, "EN English"),
-                            ];
-
-                            for (lang, label) in langs {
-                                let is_cur = self.language == lang;
-                                let btn = egui::Button::new(
-                                    RichText::new(label)
-                                        .size(11.5)
-                                        .strong()
-                                        .color(if is_cur { Color32::WHITE } else { Color32::from_rgb(170, 170, 170) }),
-                                )
-                                .fill(if is_cur { Color32::from_rgb(0, 122, 204) } else { Color32::from_rgb(36, 36, 36) })
-                                .stroke(Stroke::new(1.0_f32, if is_cur { Color32::from_rgb(30, 144, 255) } else { Color32::from_rgb(50, 50, 50) }))
-                                .rounding(Rounding::same(4.0));
-
-                                if ui.add_sized(Vec2::new(125.0, 28.0), btn).clicked() {
-                                    self.language = lang;
-                                }
-                            }
-                        });
-
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-
-                        // 2. Размер шрифта и масштаб
-                        ui.label(
-                            RichText::new(t.settings_scale)
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(200, 200, 200)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            let scales = [
-                                (UiScale::Normal, t.scale_100),
-                                (UiScale::Medium, t.scale_115),
-                                (UiScale::Large, t.scale_130),
-                                (UiScale::Huge, t.scale_145),
-                            ];
-
-                            for (scale, label) in scales {
-                                let is_cur = self.ui_scale == scale;
-                                let btn = egui::Button::new(
-                                    RichText::new(label)
-                                        .size(11.0)
-                                        .strong()
-                                        .color(if is_cur { Color32::WHITE } else { Color32::from_rgb(170, 170, 170) }),
-                                )
-                                .fill(if is_cur { Color32::from_rgb(35, 165, 90) } else { Color32::from_rgb(36, 36, 36) })
-                                .stroke(Stroke::new(1.0_f32, if is_cur { Color32::from_rgb(50, 200, 110) } else { Color32::from_rgb(50, 50, 50) }))
-                                .rounding(Rounding::same(4.0));
-
-                                if ui.add_sized(Vec2::new(125.0, 28.0), btn).clicked() {
-                                    self.ui_scale = scale;
-                                }
-                            }
-                        });
-
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-
-                        // 3. Безопасность (Здесь находится [Защита])
-                        ui.label(
-                            RichText::new(t.settings_security)
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(200, 200, 200)),
-                        );
-                        ui.add_space(6.0);
-                        ui.checkbox(
-                            &mut self.exclude_running_pc_games,
-                            RichText::new(t.protect_pc)
-                                .size(11.5)
-                                .color(Color32::from_rgb(210, 210, 210)),
-                        );
-                        ui.add_space(4.0);
-                        ui.checkbox(
-                            &mut self.minimize_to_tray,
-                            RichText::new(t.minimize_to_tray)
-                                .size(11.5)
-                                .color(Color32::from_rgb(210, 210, 210)),
-                        );
-
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-
-                        // Анти-пауза видео Discord
-                        ui.label(
-                            RichText::new("Анти-пауза видео Discord:")
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(200, 200, 200)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            let (btn_text, btn_fill, btn_stroke) = if self.anti_pause_active {
-                                ("Отключить анти-паузу видео", Color32::from_rgb(180, 50, 50), Color32::from_rgb(220, 70, 70))
-                            } else {
-                                ("Включить анти-паузу видео", Color32::from_rgb(35, 165, 90), Color32::from_rgb(50, 200, 110))
-                            };
-
-                            let ap_btn = egui::Button::new(
-                                RichText::new(btn_text)
-                                    .size(11.5)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(btn_fill)
-                            .stroke(Stroke::new(1.0_f32, btn_stroke))
-                            .rounding(Rounding::same(4.0));
-
-                            if ui.add_sized(Vec2::new(260.0, 28.0), ap_btn).clicked() {
-                                if self.anti_pause_active {
-                                    match anti_pause::uninstall_anti_pause() {
-                                        Ok(_) => {
-                                            self.anti_pause_active = false;
-                                            self.add_log("Анти-пауза видео отключена. Перезапустите Discord.");
-                                        }
-                                        Err(e) => {
-                                            self.add_log(&format!("Ошибка отключения анти-паузы: {}", e));
-                                        }
-                                    }
-                                } else {
-                                    match anti_pause::install_anti_pause() {
-                                        Ok(_) => {
-                                            self.anti_pause_active = true;
-                                            self.add_log("Анти-пауза видео включена. Перезапустите Discord.");
-                                        }
-                                        Err(e) => {
-                                            self.add_log(&format!("Ошибка включения анти-паузы: {}", e));
-                                        }
-                                    }
-                                }
-                            }
-
-                            let restart_btn = egui::Button::new(
-                                RichText::new("Перезапустить Discord")
-                                    .size(11.5)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(88, 101, 242))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(115, 128, 250)))
-                            .rounding(Rounding::same(4.0));
-
-                            if ui.add_sized(Vec2::new(170.0, 28.0), restart_btn)
-                                .on_hover_text("Перезапустить процессы Discord для применения настроек")
-                                .clicked()
-                            {
-                                match anti_pause::restart_discord() {
-                                    Ok(_) => {
-                                        self.add_log("Discord перезапущен.");
-                                    }
-                                    Err(e) => {
-                                        self.add_log(&format!("Ошибка перезапуска Discord: {}", e));
-                                    }
-                                }
-                            }
-
-                            if self.anti_pause_active {
-                                ui.label(
-                                    RichText::new("Активно")
-                                        .size(11.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(50, 225, 110)),
-                                );
-                            } else {
-                                ui.label(
-                                    RichText::new("Отключено")
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(140, 145, 155)),
-                                );
-                            }
-                        });
-
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Воспроизведение видео не останавливается при сворачивании Discord.")
-                                .size(10.5)
-                                .color(Color32::from_rgb(150, 165, 180)),
-                        );
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new("Для применения настройки перезапустите Discord.")
-                                .size(10.5)
-                                .color(Color32::from_rgb(225, 180, 80)),
-                        );
-
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-
-                        // 4. Обновления программы
-                        ui.label(
-                            RichText::new(t.settings_updates)
-                                .size(12.0)
-                                .strong()
-                                .color(Color32::from_rgb(200, 200, 200)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!("Версия: v{}", self.updater.current_version))
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(170, 170, 170)),
-                            );
-
-                            let check_btn = egui::Button::new(
-                                RichText::new(t.btn_check_updates)
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(45, 45, 50))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(70, 70, 75)))
-                            .rounding(Rounding::same(3.0));
-
-                            if ui.add(check_btn).clicked() {
-                                self.updater.check_github_update();
-                                self.add_log("Запрос проверки обновлений на GitHub...");
-                            }
-
-                            match &self.updater.status {
-                                UpdateStatus::Checking => {
-                                    ui.label(
-                                        RichText::new("Проверка GitHub...")
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(200, 200, 100)),
-                                    );
-                                }
-                                UpdateStatus::UpToDate => {
-                                    ui.label(
-                                        RichText::new(t.status_up_to_date)
-                                            .size(11.0)
-                                            .strong()
-                                            .color(Color32::from_rgb(56, 172, 88)),
-                                    );
-                                }
-                                UpdateStatus::Available { version, .. } => {
-                                    ui.label(
-                                        RichText::new(format!("[Доступна v{}]", version))
-                                            .size(11.0)
-                                            .strong()
-                                            .color(Color32::from_rgb(90, 195, 255)),
-                                    );
-                                }
-                                UpdateStatus::Downloading { progress, .. } => {
-                                    ui.label(
-                                        RichText::new(format!("Скачивание: {:.0}%", progress * 100.0))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(100, 235, 160)),
-                                    );
-                                }
-                                UpdateStatus::Installing => {
-                                    ui.label(
-                                        RichText::new("Установка...")
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(160, 180, 255)),
-                                    );
-                                }
-                                UpdateStatus::Error(err) => {
-                                    ui.label(
-                                        RichText::new(format!("[Ошибка] {}", err))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(220, 100, 100)),
-                                    );
-                                }
-                                _ => {}
-                            }
-                        });
-                    });
-                });
-            }
-            }
-        });
+        self.render_artcraft_ui(ctx);
 
         // Автоматическое сохранение настроек при их изменении
         let current_settings = AppSettings {
@@ -2775,40 +1488,61 @@ impl eframe::App for GameFarmerApp {
         self.stop_all_active_games();
         self.discord_ipc.clear_activity();
         self.saved_settings.save();
+        self.tray_manager = None;
     }
+}
+
+fn build_custom_font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Порядок: основной UI-шрифт, затем Windows Emoji (включая U+FE0F для составных эмодзи) и Symbol.
+    let system_fonts: [(&str, &str, bool); 3] = [
+        ("segoe_ui", r"C:\Windows\Fonts\segoeui.ttf", false),
+        ("segoe_emj", r"C:\Windows\Fonts\seguiemj.ttf", true),
+        ("segoe_sym", r"C:\Windows\Fonts\seguisym.ttf", true),
+    ];
+
+    let mut prop_idx = 0;
+    let mut mono_idx = fonts
+        .families
+        .get(&egui::FontFamily::Monospace)
+        .map_or(0, |list| usize::from(!list.is_empty()));
+
+    for (name, path, add_to_monospace) in system_fonts {
+        if let Ok(data) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(name.to_owned(), egui::FontData::from_owned(data));
+
+            let proportional = fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default();
+            proportional.insert(prop_idx.min(proportional.len()), name.to_owned());
+            prop_idx += 1;
+
+            if add_to_monospace {
+                let monospace = fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default();
+                monospace.insert(mono_idx.min(monospace.len()), name.to_owned());
+                mono_idx += 1;
+            }
+        }
+    }
+
+    fonts
 }
 
 fn setup_custom_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    if let Ok(font_data) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-        fonts.font_data.insert(
-            "segoe_ui".to_owned(),
-            egui::FontData::from_owned(font_data),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "segoe_ui".to_owned());
-    }
-
-    if let Ok(sym_data) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
-        fonts.font_data.insert(
-            "segoe_sym".to_owned(),
-            egui::FontData::from_owned(sym_data),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("segoe_sym".to_owned());
-    }
-
-    ctx.set_fonts(fonts);
+    ctx.set_fonts(build_custom_font_definitions());
 }
 
 fn main() -> eframe::Result<()> {
+    let Some(instance_guard) = SingleInstanceGuard::acquire_or_signal_existing() else {
+        return Ok(());
+    };
     let autostart = std::env::args().any(|a| a == "--autostart");
     let icon_data = egui::IconData {
         rgba: ICON_RGBA.to_vec(),
@@ -2818,8 +1552,9 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 760.0])
-            .with_min_inner_size([500.0, 420.0])
+            .with_decorations(false)
+            .with_inner_size([1160.0, 860.0])
+            .with_min_inner_size([620.0, 480.0])
             .with_title("Discord Game Activity Manager")
             .with_icon(icon_data)
             .with_resizable(true),
@@ -2831,7 +1566,9 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             setup_custom_fonts(&cc.egui_ctx);
+            theme::apply_artcraft_visuals(&cc.egui_ctx);
             let mut app = GameFarmerApp::default();
+            app.single_instance = Some(instance_guard);
             app.init_tray(cc.egui_ctx.clone());
             if autostart {
                 app.launch_random_batch();

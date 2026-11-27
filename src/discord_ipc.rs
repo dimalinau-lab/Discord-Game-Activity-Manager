@@ -1,21 +1,76 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
+enum IpcCommand {
+    SetActivity {
+        app_id: String,
+        details: String,
+        state: String,
+        pid: Option<u32>,
+    },
+    Clear,
+}
+
+/// Асинхронный клиент Discord Rich Presence: все операции named pipe выполняются в фоновом потоке,
+/// чтобы клики по интерфейсу не вызывали подвисаний UI.
 pub struct DiscordIpc {
+    tx: Sender<IpcCommand>,
+}
+
+struct IpcWorker {
     pipe: Option<File>,
     current_app_id: Option<String>,
 }
 
 impl DiscordIpc {
     pub fn new() -> Self {
-        Self {
-            pipe: None,
-            current_app_id: None,
-        }
+        let (tx, rx) = mpsc::channel::<IpcCommand>();
+        thread::spawn(move || {
+            let mut worker = IpcWorker {
+                pipe: None,
+                current_app_id: None,
+            };
+            while let Ok(mut cmd) = rx.recv() {
+                // Схлопываем очередь до последней актуальной команды
+                while let Ok(next) = rx.try_recv() {
+                    cmd = next;
+                }
+                match cmd {
+                    IpcCommand::SetActivity {
+                        app_id,
+                        details,
+                        state,
+                        pid,
+                    } => worker.set_activity(&app_id, &details, &state, pid),
+                    IpcCommand::Clear => worker.clear_activity(),
+                }
+            }
+        });
+        Self { tx }
     }
 
+    pub fn set_activity(&mut self, app_id: &str, details: &str, state: &str, pid: Option<u32>) {
+        if app_id.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(IpcCommand::SetActivity {
+            app_id: app_id.to_string(),
+            details: details.to_string(),
+            state: state.to_string(),
+            pid,
+        });
+    }
+
+    pub fn clear_activity(&mut self) {
+        let _ = self.tx.send(IpcCommand::Clear);
+    }
+}
+
+impl IpcWorker {
     fn connect(&mut self, app_id: &str) -> bool {
         self.disconnect();
 
@@ -30,12 +85,14 @@ impl DiscordIpc {
                 let handshake = json!({
                     "v": 1,
                     "client_id": app_id
-                }).to_string();
+                })
+                .to_string();
 
                 if Self::write_frame(&mut pipe, 0, &handshake).is_ok() {
                     let mut header = [0u8; 8];
                     if pipe.read_exact(&mut header).is_ok() {
-                        let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+                        let len =
+                            u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
                         let mut buf = vec![0u8; len];
                         let _ = pipe.read_exact(&mut buf);
                         self.pipe = Some(pipe);
@@ -58,7 +115,7 @@ impl DiscordIpc {
         Ok(())
     }
 
-    pub fn set_activity(&mut self, app_id: &str, details: &str, state: &str, pid: Option<u32>) {
+    fn set_activity(&mut self, app_id: &str, details: &str, state: &str, pid: Option<u32>) {
         if app_id.is_empty() {
             return;
         }
@@ -91,12 +148,14 @@ impl DiscordIpc {
                     }
                 },
                 "nonce": format!("{}", start_ts)
-            }).to_string();
+            })
+            .to_string();
 
             if Self::write_frame(pipe, 1, &payload).is_ok() {
                 let mut header = [0u8; 8];
                 if pipe.read_exact(&mut header).is_ok() {
-                    let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+                    let len =
+                        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
                     let mut buf = vec![0u8; len];
                     let _ = pipe.read_exact(&mut buf);
                 }
@@ -104,7 +163,7 @@ impl DiscordIpc {
         }
     }
 
-    pub fn clear_activity(&mut self) {
+    fn clear_activity(&mut self) {
         if let Some(ref mut pipe) = self.pipe {
             let payload = json!({
                 "cmd": "SET_ACTIVITY",
@@ -113,14 +172,15 @@ impl DiscordIpc {
                     "activity": null
                 },
                 "nonce": "clear"
-            }).to_string();
+            })
+            .to_string();
 
             let _ = Self::write_frame(pipe, 1, &payload);
         }
         self.disconnect();
     }
 
-    pub fn disconnect(&mut self) {
+    fn disconnect(&mut self) {
         self.pipe = None;
         self.current_app_id = None;
     }

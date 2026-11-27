@@ -18,19 +18,19 @@ impl Language {
 
 #[derive(PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum UiScale {
-    Normal, // 100%
-    Medium, // 115%
-    Large,  // 130%
-    Huge,   // 145%
+    Normal, // 100% (базовый 1.15x)
+    Medium, // 115% (1.32x)
+    Large,  // 130% (1.50x)
+    Huge,   // 145% (1.67x)
 }
 
 impl UiScale {
     pub fn factor(&self) -> f32 {
         match self {
-            UiScale::Normal => 1.0,
-            UiScale::Medium => 1.15,
-            UiScale::Large => 1.30,
-            UiScale::Huge => 1.45,
+            UiScale::Normal => 1.15,
+            UiScale::Medium => 1.32,
+            UiScale::Large => 1.50,
+            UiScale::Huge => 1.67,
         }
     }
 }

@@ -47,6 +47,7 @@ impl TrayManager {
             .map_err(|e| format!("Ошибка добавления пунктов меню: {}", e))?;
 
         let tray_icon = TrayIconBuilder::new()
+            .with_id("discord-game-farmer-tray")
             .with_menu(Box::new(tray_menu))
             .with_tooltip("Discord Game Activity Manager")
             .with_icon(icon)

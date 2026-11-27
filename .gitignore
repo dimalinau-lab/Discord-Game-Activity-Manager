@@ -29,6 +29,7 @@ tools/
 *.download
 stubs/
 updates/
+icon_cache/
 
 # ==========================================
 # Local Runtime & User Data
